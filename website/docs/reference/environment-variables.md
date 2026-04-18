@@ -227,6 +227,15 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `WHATSAPP_ALLOWED_USERS` | Comma-separated phone numbers (with country code, no `+`), or `*` to allow all senders |
 | `WHATSAPP_ALLOW_ALL_USERS` | Allow all WhatsApp senders without an allowlist (`true`/`false`) |
 | `WHATSAPP_DEBUG` | Log raw message events in the bridge for troubleshooting (`true`/`false`) |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_TOKEN` | Meta Cloud API access token (System User) for the official WhatsApp Cloud Business API platform |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_PHONE_NUMBER_ID` | Meta phone-number id (used in `graph.facebook.com/{id}/messages`) |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_WEBHOOK_SECRET` | Shared secret validated as `X-Webhook-Secret` on every forward POST from the external MCP |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_HOST` | aiohttp bind host for forward webhooks (default `0.0.0.0`) |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_PORT` | aiohttp bind port (default `8643`) |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_PATH` | URL path for forward POSTs (default `/wa`) |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_ALLOWED_USERS` | Comma-separated phones (E.164) allowed to talk to the agent |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_ALLOW_ALL_USERS` | Allow all phones without an allowlist (NOT recommended) |
+| `WHATSAPP_VIA_MCP_META_BUSINESS_API_HOME_CHANNEL` | Default phone (E.164) for cron / scheduled-message delivery |
 | `SIGNAL_HTTP_URL` | signal-cli daemon HTTP endpoint (for example `http://127.0.0.1:8080`) |
 | `SIGNAL_ACCOUNT` | Bot phone number in E.164 format |
 | `SIGNAL_ALLOWED_USERS` | Comma-separated E.164 phone numbers or UUIDs |

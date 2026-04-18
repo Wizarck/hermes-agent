@@ -67,6 +67,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    WHATSAPP_VIA_MCP_META_BUSINESS_API = "whatsapp_via_mcp_meta_business_api"
 
 
 @dataclass
@@ -805,6 +806,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API: "WHATSAPP_VIA_MCP_META_BUSINESS_API_TOKEN",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
@@ -1231,6 +1233,29 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.BLUEBUBBLES,
             chat_id=bluebubbles_home,
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
+        )
+
+    # WhatsApp via external MCP (Meta Business Cloud API)
+    wamba_token = os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_TOKEN")
+    wamba_phone_id = os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_PHONE_NUMBER_ID")
+    if wamba_token and wamba_phone_id:
+        if Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API not in config.platforms:
+            config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API] = PlatformConfig()
+        config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API].enabled = True
+        config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API].token = wamba_token
+        config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API].extra.update({
+            "phone_number_id": wamba_phone_id,
+            "webhook_secret": os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_WEBHOOK_SECRET", ""),
+            "host": os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_HOST", "0.0.0.0"),
+            "port": int(os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_PORT", "8643")),
+            "path": os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_PATH", "/wa"),
+        })
+    wamba_home = os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_HOME_CHANNEL")
+    if wamba_home and Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API in config.platforms:
+        config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API].home_channel = HomeChannel(
+            platform=Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API,
+            chat_id=wamba_home,
+            name=os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_HOME_CHANNEL_NAME", "Home"),
         )
 
     # QQ (Official Bot API v2)

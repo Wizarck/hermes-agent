@@ -215,6 +215,7 @@ def _handle_send(args):
         "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "whatsapp_via_mcp_meta_business_api": Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -573,6 +574,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
+        elif platform == Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API:
+            result = await _send_whatsapp_via_mcp_meta_business_api(
+                pconfig.token, pconfig.extra, chat_id, chunk
+            )
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -1510,6 +1515,62 @@ async def _send_qqbot(pconfig, chat_id, message):
                 return _error(f"QQBot send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
+
+
+async def _send_whatsapp_via_mcp_meta_business_api(token, extra, chat_id, message):
+    """Send WhatsApp text via Meta Cloud Business API.
+
+    The token comes from PlatformConfig.token (env var
+    WHATSAPP_VIA_MCP_META_BUSINESS_API_TOKEN). The phone-number id is read from
+    PlatformConfig.extra (populated by _apply_env_overrides from
+    WHATSAPP_VIA_MCP_META_BUSINESS_API_PHONE_NUMBER_ID).
+    """
+    extra = extra or {}
+    phone_id = extra.get("phone_number_id") or os.getenv(
+        "WHATSAPP_VIA_MCP_META_BUSINESS_API_PHONE_NUMBER_ID", ""
+    )
+    if not token:
+        return _error(
+            "WHATSAPP_VIA_MCP_META_BUSINESS_API_TOKEN is not set"
+        )
+    if not phone_id:
+        return _error(
+            "WHATSAPP_VIA_MCP_META_BUSINESS_API_PHONE_NUMBER_ID is not set"
+        )
+    base_url = (
+        extra.get("meta_base_url")
+        or os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_META_BASE_URL")
+        or "https://graph.facebook.com/v21.0"
+    )
+    url = f"{base_url}/{phone_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": chat_id,
+        "type": "text",
+        "text": {"body": message[:4096]},
+    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            return _error(
+                f"WhatsApp via MCP Meta Cloud API send failed: {resp.status_code} {resp.text[:200]}"
+            )
+        try:
+            mid = resp.json().get("messages", [{}])[0].get("id", "")
+        except Exception:
+            mid = ""
+        return {
+            "success": True,
+            "platform": "whatsapp_via_mcp_meta_business_api",
+            "chat_id": chat_id,
+            "message_id": mid,
+        }
+    except Exception as e:
+        return _error(f"WhatsApp via MCP Meta Cloud API send failed: {e}")
 
 
 # --- Registry ---

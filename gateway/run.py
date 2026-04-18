@@ -2833,6 +2833,18 @@ class GatewayRunner:
                 return None
             return QQAdapter(config)
 
+        elif platform == Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API:
+            from gateway.platforms.whatsapp_via_mcp_meta_business_api import (
+                WhatsAppViaMcpMetaBusinessApiAdapter,
+                check_whatsapp_via_mcp_meta_business_api_requirements,
+            )
+            if not check_whatsapp_via_mcp_meta_business_api_requirements():
+                logger.warning(
+                    "WhatsApp via MCP (Meta Business API): aiohttp/httpx missing"
+                )
+                return None
+            return WhatsAppViaMcpMetaBusinessApiAdapter(config)
+
         return None
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -2875,6 +2887,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
+            Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API: "WHATSAPP_VIA_MCP_META_BUSINESS_API_ALLOWED_USERS",
         }
         platform_group_env_map = {
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
@@ -2896,6 +2909,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+            Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API: "WHATSAPP_VIA_MCP_META_BUSINESS_API_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
