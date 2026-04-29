@@ -40,6 +40,9 @@ import hmac
 import json
 import logging
 import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
@@ -231,6 +234,35 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
         if not content:
             return web.json_response({"ok": True, "skipped": "empty"})
 
+        # ELIGIA HITL pre-check: if this looks like an "aprobar X" / "rechazar X"
+        # reply from a bound identity, write the resolution and ack — skip the
+        # LLM (per .ai-playbook/specs/apply-fix-contract.md §Identity binding).
+        hitl_match = self._try_parse_hitl_intent(phone, content)
+        if hitl_match is not None:
+            written = self._write_hitl_resolution(hitl_match)
+            if written:
+                ack = (
+                    f"✅ Aprobado: {hitl_match['request_id']}"
+                    if hitl_match["approved"]
+                    else f"❌ Rechazado: {hitl_match['request_id']}"
+                )
+                asyncio.create_task(self.send(chat_id=phone, content=ack))
+                logger.info(
+                    "WhatsApp HITL resolved request_id=%s approved=%s phone=%s",
+                    hitl_match["request_id"],
+                    hitl_match["approved"],
+                    _redact_phone(phone),
+                )
+                return web.json_response({"ok": True, "hitl": True})
+            # Write failed — fall through to normal LLM handling so the user
+            # sees Hermes' generic response rather than a silent drop.
+            logger.error(
+                "WhatsApp HITL resolution write failed; falling through to LLM. "
+                "phone=%s request_id=%s",
+                _redact_phone(phone),
+                hitl_match.get("request_id"),
+            )
+
         source = self.build_source(
             chat_id=phone,
             user_id=phone,
@@ -364,3 +396,96 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
         except Exception:
             mid = ""
         return SendResult(success=True, message_id=mid)
+
+    # ------------------------------------------------------------------ ELIGIA HITL
+
+    # Approval verbs (case-insensitive). Includes Spanish stems and a couple of
+    # common English fallbacks. The captured group is the request_id.
+    _HITL_APPROVE_RE = re.compile(
+        r"^\s*(?:aprob\w*|aprueb\w*|✅|ok\b|si\b|sí\b|dale\b|yes\b|y\b)\s+(?:el\s+)?(\S+?)\s*$",
+        re.IGNORECASE,
+    )
+    _HITL_REJECT_RE = re.compile(
+        r"^\s*(?:rechaz\w*|recha\w*|❌|no\b|nope\b|n\b)\s+(?:el\s+)?(\S+?)\s*$",
+        re.IGNORECASE,
+    )
+
+    def _try_parse_hitl_intent(self, phone: str, content: str) -> Optional[Dict[str, Any]]:
+        """Detect HITL approve/reject intent in a WhatsApp message.
+
+        Returns ``None`` if the message is not an HITL response (so the
+        caller falls through to the LLM). Otherwise returns a dict with
+        ``request_id``, ``approved``, ``signer``.
+
+        Identity binding: only senders whose phone is in
+        ``WA_HITL_ARTURO_E164`` (env, comma-separated for future
+        multi-signer; v1 is single-signer) get their replies recognised
+        as HITL. Other senders are ignored — Hermes' regular LLM picks
+        them up. The audit-log of identity rejections is intentionally
+        skipped here because non-bound senders are not "trying" to
+        approve; they're just chatting normally.
+        """
+        # Identity binding (HITL-specific list, distinct from
+        # WHATSAPP_VIA_MCP_META_BUSINESS_API_ALLOWED_USERS which gates
+        # conversational access).
+        bound_raw = os.environ.get("WA_HITL_ARTURO_E164", "")
+        bound = {p.strip() for p in bound_raw.split(",") if p.strip()}
+        if not bound or phone not in bound:
+            return None
+
+        approved: Optional[bool] = None
+        request_id: Optional[str] = None
+        m = self._HITL_APPROVE_RE.match(content)
+        if m:
+            approved = True
+            request_id = m.group(1)
+        else:
+            m = self._HITL_REJECT_RE.match(content)
+            if m:
+                approved = False
+                request_id = m.group(1)
+
+        if approved is None or not request_id:
+            return None
+
+        return {
+            "request_id": request_id,
+            "approved": approved,
+            "signer": f"whatsapp:{phone}",
+        }
+
+    def _write_hitl_resolution(self, match: Dict[str, Any]) -> bool:
+        """Append a resolution line to ``$ELIGIA_HITL_DIR/approvals-resolved.jsonl``.
+
+        Returns True on success, False on filesystem error. Called by
+        ``_handle_webhook`` after a successful HITL intent parse + identity
+        bind.
+        """
+        hitl_dir = Path(os.environ.get("ELIGIA_HITL_DIR", "/opt/eligia/data/hitl"))
+        try:
+            hitl_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.error(
+                "WhatsApp HITL: mkdir failed at %s: %s", hitl_dir, exc
+            )
+            return False
+
+        resolution = {
+            "request_id": match["request_id"],
+            "approved": bool(match["approved"]),
+            "signer": match["signer"],
+            "channel": "whatsapp",
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        resolved_path = hitl_dir / "approvals-resolved.jsonl"
+        try:
+            with resolved_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(resolution, ensure_ascii=False) + "\n")
+            return True
+        except OSError as exc:
+            logger.error(
+                "WhatsApp HITL: resolution write failed at %s: %s",
+                resolved_path,
+                exc,
+            )
+            return False
