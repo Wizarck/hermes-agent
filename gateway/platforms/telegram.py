@@ -1589,6 +1589,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         data = query.data
 
+        # --- HITL approval callbacks ---
+        # Per ai-playbook/specs/apply-fix-contract.md, ELIGIA workflows can
+        # request human approval via this bot. Inline-keyboard buttons emit
+        # callback_data with prefix "hitl:approve|reject:<request_id>"; we
+        # write the resolution to a shared volume read by workflow polling.
+        if data.startswith("hitl:"):
+            await self._handle_hitl_callback(query, data)
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -2360,6 +2369,122 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._message_mentions_bot(message):
             return True
         return self._message_matches_mention_patterns(message)
+
+    async def _handle_hitl_callback(self, query, data: str) -> None:
+        """Handle ELIGIA HITL approval callbacks (data prefix: "hitl:").
+
+        Per ai-playbook/specs/apply-fix-contract.md, ELIGIA workflows can
+        request human approval via this Telegram bot. Inline-keyboard buttons
+        emit callback_data shaped as "hitl:<approve|reject>:<request_id>".
+        This handler:
+
+          1. Validates identity against TELEGRAM_ALLOWED_USERS (env, comma-sep);
+             rejected attempts are audit-logged at warn severity and never
+             write to the resolved file.
+          2. Parses the callback_data; malformed inputs answer with a toast
+             and exit cleanly.
+          3. Appends the resolution as a single-line JSONL record to
+             ``$ELIGIA_HITL_DIR/approvals-resolved.jsonl`` (default
+             ``/opt/eligia/data/hitl``). The eligia-core langgraph workflow
+             polling `request_approval` picks it up on the next 5 s tick.
+          4. Calls answerCallbackQuery so the inline-keyboard button stops
+             spinning in the user's chat.
+
+        Errors at any stage are logged but never raised — the contract is
+        best-effort: if writing the resolution fails, the user sees an
+        error toast and the workflow eventually times out at 24 h, which
+        is the documented degraded mode.
+        """
+        from datetime import datetime, timezone
+        user_id = str(query.from_user.id) if query.from_user else ""
+
+        # Identity binding (apply-fix-contract.md §Identity binding).
+        allowed_raw = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
+        allowed = {s.strip() for s in allowed_raw.split(",") if s.strip()}
+        if not allowed or user_id not in allowed:
+            request_id_hint = None
+            parts_for_audit = data.split(":", 2)
+            if len(parts_for_audit) == 3:
+                request_id_hint = parts_for_audit[2]
+            self._log_hitl_event("hitl.identity.rejected", {
+                "channel": "telegram",
+                "attempted_id": user_id,
+                "request_id": request_id_hint,
+                "severity": "warn",
+                "raw_data": data[:512],
+            })
+            try:
+                await query.answer(text="No autorizado.", show_alert=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[telegram] HITL answerCallbackQuery (rejection) failed: %s", exc)
+            return
+
+        # Parse "hitl:<approve|reject>:<request_id>"
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[0] != "hitl" or parts[1] not in ("approve", "reject"):
+            try:
+                await query.answer(text="Callback HITL inválido.", show_alert=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[telegram] HITL answerCallbackQuery (invalid) failed: %s", exc)
+            return
+
+        action, request_id = parts[1], parts[2]
+        approved = action == "approve"
+        signer = f"telegram:{user_id}"
+
+        hitl_dir = _Path(os.environ.get("ELIGIA_HITL_DIR", "/opt/eligia/data/hitl"))
+        try:
+            hitl_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.error("[telegram] HITL dir mkdir failed at %s: %s", hitl_dir, exc)
+            try:
+                await query.answer(text="Error guardando aprobación (mkdir).", show_alert=True)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        resolution = {
+            "request_id": request_id,
+            "approved": approved,
+            "signer": signer,
+            "channel": "telegram",
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        resolved_path = hitl_dir / "approvals-resolved.jsonl"
+        try:
+            with resolved_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(resolution, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.error("[telegram] HITL resolution write failed at %s: %s", resolved_path, exc)
+            try:
+                await query.answer(text="Error guardando aprobación (write).", show_alert=True)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        confirmation = "✅ Aprobado." if approved else "❌ Rechazado."
+        try:
+            await query.answer(text=confirmation, show_alert=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[telegram] HITL answerCallbackQuery failed: %s", exc)
+
+    def _log_hitl_event(self, event: str, attrs: Dict[str, Any]) -> None:
+        """Append a structured event to ``$ELIGIA_HITL_DIR/events.jsonl``.
+
+        Used for HITL-specific audit logging (identity rejections, etc.).
+        Best-effort; logging failures are dropped to avoid blocking the
+        callback handler.
+        """
+        from datetime import datetime, timezone
+        hitl_dir = _Path(os.environ.get("ELIGIA_HITL_DIR", "/opt/eligia/data/hitl"))
+        events_path = hitl_dir / "events.jsonl"
+        row = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **attrs}
+        try:
+            hitl_dir.mkdir(parents=True, exist_ok=True)
+            with events_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
