@@ -418,8 +418,11 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
         r"^\s*(?:aprob\w*|aprueb\w*|✅|ok|si|sí|dale|yes|y|1|👍)\s*$",
         re.IGNORECASE,
     )
+    # Reject side uses "2" (not "0") to match human IVR-list convention:
+    # "1) approve / 2) reject" is the cognitive default. The envelope body
+    # in channels/whatsapp.py renders the numbered list explicitly.
     _HITL_BARE_REJECT_RE = re.compile(
-        r"^\s*(?:rechaz\w*|recha\w*|❌|no|nope|n|0|👎)\s*$",
+        r"^\s*(?:rechaz\w*|recha\w*|❌|no|nope|n|2|👎)\s*$",
         re.IGNORECASE,
     )
 
