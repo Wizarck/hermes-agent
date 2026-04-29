@@ -41,9 +41,9 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     from aiohttp import web
@@ -410,6 +410,23 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
         re.IGNORECASE,
     )
 
+    # Bare-token shortcuts (no request_id). When matched, the handler resolves
+    # against the MOST RECENT OPEN envelope from approvals-pending.jsonl
+    # (within the 24 h staleness cutoff). No-match-on-bare implies no open
+    # request → fall through to the LLM so plain "1"/"no" stay conversational.
+    _HITL_BARE_APPROVE_RE = re.compile(
+        r"^\s*(?:aprob\w*|aprueb\w*|✅|ok|si|sí|dale|yes|y|1|👍)\s*$",
+        re.IGNORECASE,
+    )
+    _HITL_BARE_REJECT_RE = re.compile(
+        r"^\s*(?:rechaz\w*|recha\w*|❌|no|nope|n|0|👎)\s*$",
+        re.IGNORECASE,
+    )
+
+    # Pending entries older than this are skipped when resolving bare tokens
+    # (matches the global 24 h timeout in apply-fix-contract.md §Envelope).
+    _HITL_PENDING_STALENESS_HOURS = 24
+
     def _try_parse_hitl_intent(self, phone: str, content: str) -> Optional[Dict[str, Any]]:
         """Detect HITL approve/reject intent in a WhatsApp message.
 
@@ -435,6 +452,8 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
 
         approved: Optional[bool] = None
         request_id: Optional[str] = None
+
+        # 1. Try explicit "verb + id" patterns first.
         m = self._HITL_APPROVE_RE.match(content)
         if m:
             approved = True
@@ -445,6 +464,19 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
                 approved = False
                 request_id = m.group(1)
 
+        # 2. Bare-token shortcut (no id). Look up the most recent open request.
+        #    Only applies when the explicit form did NOT match — guards against
+        #    false positives like "ok abc-123" matching both forms.
+        if approved is None:
+            if self._HITL_BARE_APPROVE_RE.match(content):
+                request_id = self._find_most_recent_open_request_id()
+                if request_id:
+                    approved = True
+            elif self._HITL_BARE_REJECT_RE.match(content):
+                request_id = self._find_most_recent_open_request_id()
+                if request_id:
+                    approved = False
+
         if approved is None or not request_id:
             return None
 
@@ -453,6 +485,85 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
             "approved": approved,
             "signer": f"whatsapp:{phone}",
         }
+
+    def _find_most_recent_open_request_id(self) -> Optional[str]:
+        """Return the latest unresolved request_id within the staleness window.
+
+        Reads ``$ELIGIA_HITL_DIR/approvals-pending.jsonl`` and skips any entry
+        whose ``request_id`` already appears in ``approvals-resolved.jsonl``.
+        Returns None when:
+          - the pending file does not exist,
+          - it is empty,
+          - all entries are resolved already, or
+          - all entries are older than _HITL_PENDING_STALENESS_HOURS.
+
+        Used by ``_try_parse_hitl_intent`` to handle bare-token shortcuts
+        like "1", "ok", "no".
+        """
+        hitl_dir = Path(os.environ.get("ELIGIA_HITL_DIR", "/opt/eligia/data/hitl"))
+        pending = hitl_dir / "approvals-pending.jsonl"
+        resolved = hitl_dir / "approvals-resolved.jsonl"
+
+        if not pending.is_file():
+            return None
+
+        # Build the set of already-resolved ids.
+        resolved_ids: set[str] = set()
+        if resolved.is_file():
+            try:
+                with resolved.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        rid = entry.get("request_id")
+                        if rid:
+                            resolved_ids.add(rid)
+            except OSError:
+                # If resolved is unreadable, treat as no-resolutions; we may
+                # double-resolve a request, but the workflow polling layer
+                # already deduplicates by request_id.
+                resolved_ids = set()
+
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=self._HITL_PENDING_STALENESS_HOURS)
+        )
+
+        try:
+            with pending.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return None
+
+        # Walk the pending file in reverse to find the most recent open
+        # (non-resolved, non-stale) entry.
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = entry.get("request_id")
+            if not rid or rid in resolved_ids:
+                continue
+            ts_str = entry.get("ts", "")
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                # Missing/malformed ts → treat as stale (skip).
+                continue
+            if ts < cutoff:
+                continue
+            return rid
+
+        return None
 
     def _write_hitl_resolution(self, match: Dict[str, Any]) -> bool:
         """Append a resolution line to ``$ELIGIA_HITL_DIR/approvals-resolved.jsonl``.
