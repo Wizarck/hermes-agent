@@ -251,6 +251,23 @@ class TestBuildApiKwargsChatCompletionsServiceTier:
         assert "service_tier" not in kwargs
 
 
+class TestBuildApiKwargsKimiNoTemperatureOverride:
+    def test_kimi_for_coding_omits_temperature(self, monkeypatch):
+        """Temperature should NOT be set client-side for Kimi models.
+
+        The Kimi gateway selects the correct temperature server-side.
+        """
+        agent = _make_agent(
+            monkeypatch,
+            "kimi-coding",
+            base_url="https://api.kimi.com/coding/v1",
+            model="kimi-for-coding",
+        )
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert "temperature" not in kwargs
+
+
 class TestBuildApiKwargsAIGateway:
     def test_uses_chat_completions_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")

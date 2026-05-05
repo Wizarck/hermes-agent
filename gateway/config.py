@@ -67,6 +67,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    WHATSAPP_VIA_MCP_META_BUSINESS_API = "whatsapp_via_mcp_meta_business_api"
 
 
 @dataclass
@@ -576,6 +577,14 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
+                if "dm_policy" in platform_cfg:
+                    bridged["dm_policy"] = platform_cfg["dm_policy"]
+                if "allow_from" in platform_cfg:
+                    bridged["allow_from"] = platform_cfg["allow_from"]
+                if "group_policy" in platform_cfg:
+                    bridged["group_policy"] = platform_cfg["group_policy"]
+                if "group_allow_from" in platform_cfg:
+                    bridged["group_allow_from"] = platform_cfg["group_allow_from"]
                 if plat == Platform.DISCORD and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
                 if "channel_prompts" in platform_cfg:
@@ -700,6 +709,20 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
+                if "dm_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_DM_POLICY"):
+                    os.environ["WHATSAPP_DM_POLICY"] = str(whatsapp_cfg["dm_policy"]).lower()
+                af = whatsapp_cfg.get("allow_from")
+                if af is not None and not os.getenv("WHATSAPP_ALLOWED_USERS"):
+                    if isinstance(af, list):
+                        af = ",".join(str(v) for v in af)
+                    os.environ["WHATSAPP_ALLOWED_USERS"] = str(af)
+                if "group_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_GROUP_POLICY"):
+                    os.environ["WHATSAPP_GROUP_POLICY"] = str(whatsapp_cfg["group_policy"]).lower()
+                gaf = whatsapp_cfg.get("group_allow_from")
+                if gaf is not None and not os.getenv("WHATSAPP_GROUP_ALLOWED_USERS"):
+                    if isinstance(gaf, list):
+                        gaf = ",".join(str(v) for v in gaf)
+                    os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
 
             # DingTalk settings → env vars (env vars take precedence)
             dingtalk_cfg = yaml_cfg.get("dingtalk", {})
@@ -783,6 +806,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API: "WHATSAPP_VIA_MCP_META_BUSINESS_API_TOKEN",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
@@ -1209,6 +1233,29 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.BLUEBUBBLES,
             chat_id=bluebubbles_home,
             name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
+        )
+
+    # WhatsApp via external MCP (Meta Business Cloud API)
+    wamba_token = os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_TOKEN")
+    wamba_phone_id = os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_PHONE_NUMBER_ID")
+    if wamba_token and wamba_phone_id:
+        if Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API not in config.platforms:
+            config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API] = PlatformConfig()
+        config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API].enabled = True
+        config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API].token = wamba_token
+        config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API].extra.update({
+            "phone_number_id": wamba_phone_id,
+            "webhook_secret": os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_WEBHOOK_SECRET", ""),
+            "host": os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_HOST", "0.0.0.0"),
+            "port": int(os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_PORT", "8643")),
+            "path": os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_PATH", "/wa"),
+        })
+    wamba_home = os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_HOME_CHANNEL")
+    if wamba_home and Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API in config.platforms:
+        config.platforms[Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API].home_channel = HomeChannel(
+            platform=Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API,
+            chat_id=wamba_home,
+            name=os.getenv("WHATSAPP_VIA_MCP_META_BUSINESS_API_HOME_CHANNEL_NAME", "Home"),
         )
 
     # QQ (Official Bot API v2)

@@ -693,6 +693,10 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     - If it looks like a session ID (contains underscore + hex), try direct lookup first.
     - Otherwise, treat it as a title and use resolve_session_by_title (auto-latest).
     - Falls back to the other method if the first doesn't match.
+    - If the resolved session is a compression root, follow the chain forward
+      to the latest continuation. Users who remember the old root ID (e.g.
+      from an exit summary printed before the bug fix, or from notes) get
+      resumed at the live tip instead of a stale parent with no messages.
     """
     try:
         from hermes_state import SessionDB
@@ -701,14 +705,23 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
 
         # Try as exact session ID first
         session = db.get_session(name_or_id)
+        resolved_id: Optional[str] = None
         if session:
-            db.close()
-            return session["id"]
+            resolved_id = session["id"]
+        else:
+            # Try as title (with auto-latest for lineage)
+            resolved_id = db.resolve_session_by_title(name_or_id)
 
-        # Try as title (with auto-latest for lineage)
-        session_id = db.resolve_session_by_title(name_or_id)
+        if resolved_id:
+            # Project forward through compression chain so resumes land on
+            # the live tip instead of a dead compressed parent.
+            try:
+                resolved_id = db.get_compression_tip(resolved_id) or resolved_id
+            except Exception:
+                pass
+
         db.close()
-        return session_id
+        return resolved_id
     except Exception:
         pass
     return None
@@ -897,6 +910,10 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     _ensure_tui_node()
 
     def _node_bin(bin: str) -> str:
+        if bin == "node":
+            env_node = os.environ.get("HERMES_NODE")
+            if env_node and os.path.isfile(env_node) and os.access(env_node, os.X_OK):
+                return env_node
         path = shutil.which(bin)
         if not path:
             print(f"{bin} not found — install Node.js to use the TUI.")
@@ -1467,7 +1484,8 @@ def select_provider_and_model(args=None):
     )
     if _has_saved_custom_list:
         ordered.append(("remove-custom", "Remove a saved custom provider"))
-    ordered.append(("cancel", "Cancel"))
+    ordered.append(("aux-config", "Configure auxiliary models..."))
+    ordered.append(("cancel", "Leave unchanged"))
 
     provider_idx = _prompt_provider_choice(
         [label for _, label in ordered],
@@ -1478,6 +1496,10 @@ def select_provider_and_model(args=None):
         return
 
     selected_provider = ordered[provider_idx][0]
+
+    if selected_provider == "aux-config":
+        _aux_config_menu()
+        return
 
     # Step 2: Provider-specific setup + model selection
     if selected_provider == "openrouter":
@@ -1577,6 +1599,328 @@ def _clear_stale_openai_base_url():
             if len(stale_url) > 40
             else f"Cleared stale OPENAI_BASE_URL from .env (was: {stale_url})"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auxiliary model configuration
+#
+# Hermes uses lightweight "auxiliary" models for side tasks (vision analysis,
+# context compression, web extraction, session search, etc.). Each task has
+# its own provider+model pair in config.yaml under `auxiliary.<task>`.
+#
+# The UI lives behind "Configure auxiliary models..." at the bottom of the
+# `hermes model` provider picker. It does NOT re-run credential setup — it
+# only routes already-authenticated providers to specific aux tasks. Users
+# configure new providers through the normal `hermes model` flow first.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# (task_key, display_name, short_description)
+_AUX_TASKS: list[tuple[str, str, str]] = [
+    ("vision",           "Vision",           "image/screenshot analysis"),
+    ("compression",      "Compression",      "context summarization"),
+    ("web_extract",      "Web extract",      "web page summarization"),
+    ("session_search",   "Session search",   "past-conversation recall"),
+    ("approval",         "Approval",         "smart command approval"),
+    ("mcp",              "MCP",              "MCP tool reasoning"),
+    ("flush_memories",   "Flush memories",   "memory consolidation"),
+    ("title_generation", "Title generation", "session titles"),
+    ("skills_hub",       "Skills hub",       "skills search/install"),
+]
+
+
+def _format_aux_current(task_cfg: dict) -> str:
+    """Render the current aux config for display in the task menu."""
+    if not isinstance(task_cfg, dict):
+        return "auto"
+    base_url = str(task_cfg.get("base_url") or "").strip()
+    provider = str(task_cfg.get("provider") or "auto").strip() or "auto"
+    model = str(task_cfg.get("model") or "").strip()
+    if base_url:
+        short = base_url.replace("https://", "").replace("http://", "").rstrip("/")
+        return f"custom ({short})" + (f" · {model}" if model else "")
+    if provider == "auto":
+        return "auto" + (f" · {model}" if model else "")
+    if model:
+        return f"{provider} · {model}"
+    return provider
+
+
+def _save_aux_choice(
+    task: str,
+    *,
+    provider: str,
+    model: str = "",
+    base_url: str = "",
+    api_key: str = "",
+) -> None:
+    """Persist an auxiliary task's provider/model to config.yaml.
+
+    Only writes the four routing fields — timeout, download_timeout, and any
+    other task-specific settings are preserved untouched. The main model
+    config (``model.default``/``model.provider``) is never modified.
+    """
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    aux = cfg.setdefault("auxiliary", {})
+    if not isinstance(aux, dict):
+        aux = {}
+        cfg["auxiliary"] = aux
+    entry = aux.setdefault(task, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        aux[task] = entry
+    entry["provider"] = provider
+    entry["model"] = model or ""
+    entry["base_url"] = base_url or ""
+    entry["api_key"] = api_key or ""
+    save_config(cfg)
+
+
+def _reset_aux_to_auto() -> int:
+    """Reset every known aux task back to auto/empty. Returns number reset."""
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    aux = cfg.setdefault("auxiliary", {})
+    if not isinstance(aux, dict):
+        aux = {}
+        cfg["auxiliary"] = aux
+    count = 0
+    for task, _name, _desc in _AUX_TASKS:
+        entry = aux.setdefault(task, {})
+        if not isinstance(entry, dict):
+            entry = {}
+            aux[task] = entry
+        changed = False
+        if entry.get("provider") not in (None, "", "auto"):
+            entry["provider"] = "auto"
+            changed = True
+        for field in ("model", "base_url", "api_key"):
+            if entry.get(field):
+                entry[field] = ""
+                changed = True
+        # Preserve timeout/download_timeout — those are user-tuned, not routing
+        if changed:
+            count += 1
+    save_config(cfg)
+    return count
+
+
+def _aux_config_menu() -> None:
+    """Top-level auxiliary-model picker — choose a task to configure.
+
+    Loops until the user picks "Back" so multiple tasks can be configured
+    without returning to the main provider menu.
+    """
+    from hermes_cli.config import load_config
+
+    while True:
+        cfg = load_config()
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+
+        print()
+        print("  Auxiliary models — side-task routing")
+        print()
+        print("  Side tasks (vision, compression, web extraction, etc.) default")
+        print("  to your main chat model.  \"auto\" means \"use my main model\" —")
+        print("  Hermes only falls back to a lightweight backend (OpenRouter,")
+        print("  Nous Portal) if the main model is unavailable.  Override a")
+        print("  task below if you want it pinned to a specific provider/model.")
+        print()
+
+        # Build the task menu with current settings inline
+        name_col = max(len(name) for _, name, _ in _AUX_TASKS) + 2
+        desc_col = max(len(desc) for _, _, desc in _AUX_TASKS) + 4
+        entries: list[tuple[str, str]] = []
+        for task_key, name, desc in _AUX_TASKS:
+            task_cfg = aux.get(task_key, {}) if isinstance(aux.get(task_key), dict) else {}
+            current = _format_aux_current(task_cfg)
+            label = f"{name.ljust(name_col)}{('(' + desc + ')').ljust(desc_col)}{current}"
+            entries.append((task_key, label))
+        entries.append(("__reset__", "Reset all to auto"))
+        entries.append(("__back__",  "Back"))
+
+        idx = _prompt_provider_choice(
+            [label for _, label in entries], default=0,
+        )
+        if idx is None:
+            return
+        key = entries[idx][0]
+        if key == "__back__":
+            return
+        if key == "__reset__":
+            n = _reset_aux_to_auto()
+            if n:
+                print(f"Reset {n} auxiliary task(s) to auto.")
+            else:
+                print("All auxiliary tasks were already set to auto.")
+            print()
+            continue
+        # Otherwise configure the specific task
+        _aux_select_for_task(key)
+
+
+def _aux_select_for_task(task: str) -> None:
+    """Pick a provider + model for a single auxiliary task and persist it.
+
+    Uses ``list_authenticated_providers()`` to only show providers the user
+    has already configured. This avoids re-running OAuth/credential flows
+    inside the aux picker — users set up new providers through the normal
+    ``hermes model`` flow, then route aux tasks to them here.
+    """
+    from hermes_cli.config import load_config
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    cfg = load_config()
+    aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+    task_cfg = aux.get(task, {}) if isinstance(aux.get(task), dict) else {}
+    current_provider = str(task_cfg.get("provider") or "auto").strip() or "auto"
+    current_model = str(task_cfg.get("model") or "").strip()
+    current_base_url = str(task_cfg.get("base_url") or "").strip()
+
+    display_name = next((name for key, name, _ in _AUX_TASKS if key == task), task)
+
+    # Gather authenticated providers (has credentials + curated model list)
+    try:
+        providers = list_authenticated_providers(current_provider=current_provider)
+    except Exception as exc:
+        print(f"Could not detect authenticated providers: {exc}")
+        providers = []
+
+    entries: list[tuple[str, str, list[str]]] = []  # (slug, label, models)
+    # "auto" always first
+    auto_marker = "  ← current" if current_provider == "auto" and not current_base_url else ""
+    entries.append(("__auto__", f"auto (recommended){auto_marker}", []))
+
+    for p in providers:
+        slug = p.get("slug", "")
+        name = p.get("name") or slug
+        total = p.get("total_models", 0)
+        models = p.get("models") or []
+        model_hint = f" — {total} models" if total else ""
+        marker = "  ← current" if slug == current_provider and not current_base_url else ""
+        entries.append((slug, f"{name}{model_hint}{marker}", list(models)))
+
+    # Custom endpoint (raw base_url)
+    custom_marker = "  ← current" if current_base_url else ""
+    entries.append(("__custom__", f"Custom endpoint (direct URL){custom_marker}", []))
+    entries.append(("__back__", "Back", []))
+
+    print()
+    print(f"  Configure {display_name} — current: {_format_aux_current(task_cfg)}")
+    print()
+
+    idx = _prompt_provider_choice([label for _, label, _ in entries], default=0)
+    if idx is None:
+        return
+    slug, _label, models = entries[idx]
+
+    if slug == "__back__":
+        return
+
+    if slug == "__auto__":
+        _save_aux_choice(task, provider="auto", model="", base_url="", api_key="")
+        print(f"{display_name}: reset to auto.")
+        return
+
+    if slug == "__custom__":
+        _aux_flow_custom_endpoint(task, task_cfg)
+        return
+
+    # Regular provider — pick a model from its curated list
+    _aux_flow_provider_model(task, slug, models, current_model)
+
+
+def _aux_flow_provider_model(
+    task: str,
+    provider_slug: str,
+    curated_models: list,
+    current_model: str = "",
+) -> None:
+    """Prompt for a model under an already-authenticated provider, save to aux."""
+    from hermes_cli.auth import _prompt_model_selection
+    from hermes_cli.models import get_pricing_for_provider
+
+    display_name = next((name for key, name, _ in _AUX_TASKS if key == task), task)
+
+    # Fetch live pricing for this provider (non-blocking)
+    pricing: dict = {}
+    try:
+        pricing = get_pricing_for_provider(provider_slug) or {}
+    except Exception:
+        pricing = {}
+
+    model_list = list(curated_models)
+
+    # Let the user pick a model. _prompt_model_selection supports "Enter custom
+    # model name" and cancel.  When there's no curated list (rare), fall back
+    # to a raw input prompt.
+    if not model_list:
+        print(f"No curated model list for {provider_slug}.")
+        print("Enter a model slug manually (blank = use provider default):")
+        try:
+            val = input("Model: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+        selected = val or ""
+    else:
+        selected = _prompt_model_selection(
+            model_list, current_model=current_model, pricing=pricing,
+        )
+        if selected is None:
+            print("No change.")
+            return
+
+    _save_aux_choice(task, provider=provider_slug, model=selected or "",
+                     base_url="", api_key="")
+    if selected:
+        print(f"{display_name}: {provider_slug} · {selected}")
+    else:
+        print(f"{display_name}: {provider_slug} (provider default model)")
+
+
+def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
+    """Prompt for a direct OpenAI-compatible base_url + optional api_key/model."""
+    import getpass
+
+    display_name = next((name for key, name, _ in _AUX_TASKS if key == task), task)
+    current_base_url = str(task_cfg.get("base_url") or "").strip()
+    current_model = str(task_cfg.get("model") or "").strip()
+
+    print()
+    print(f"  Custom endpoint for {display_name}")
+    print("  Provide an OpenAI-compatible base URL (e.g. http://localhost:11434/v1)")
+    print()
+    try:
+        url_prompt = f"Base URL [{current_base_url}]: " if current_base_url else "Base URL: "
+        url = input(url_prompt).strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+    url = url or current_base_url
+    if not url:
+        print("No URL provided. No change.")
+        return
+    try:
+        model_prompt = f"Model slug (optional) [{current_model}]: " if current_model else "Model slug (optional): "
+        model = input(model_prompt).strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+    model = model or current_model
+    try:
+        api_key = getpass.getpass("API key (optional, blank = use OPENAI_API_KEY): ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+
+    _save_aux_choice(
+        task, provider="custom", model=model, base_url=url, api_key=api_key,
+    )
+    short_url = url.replace("https://", "").replace("http://", "").rstrip("/")
+    print(f"{display_name}: custom ({short_url})" + (f" · {model}" if model else ""))
 
 
 def _prompt_provider_choice(choices, *, default=0):
@@ -2020,7 +2364,7 @@ def _model_flow_google_gemini_cli(_config, current_model=""):
         return
 
     models = list(_PROVIDER_MODELS.get("google-gemini-cli") or [])
-    default = current_model or (models[0] if models else "gemini-2.5-flash")
+    default = current_model or (models[0] if models else "gemini-3-flash-preview")
     selected = _prompt_model_selection(models, current_model=default)
     if selected:
         _save_model_choice(selected)
@@ -2996,8 +3340,9 @@ def _model_flow_kimi(config, current_model=""):
 
     # Step 3: Model selection — show appropriate models for the endpoint
     if is_coding_plan:
-        # Coding Plan models (kimi-k2.5 first)
+        # Coding Plan models (kimi-k2.6 first)
         model_list = [
+            "kimi-k2.6",
             "kimi-k2.5",
             "kimi-for-coding",
             "kimi-k2-thinking",
@@ -3642,7 +3987,7 @@ def _model_flow_anthropic(config, current_model=""):
 
         elif choice == "2":
             print()
-            print("  Get an API key at: https://console.anthropic.com/settings/keys")
+            print("  Get an API key at: https://platform.claude.com/settings/keys")
             print()
             try:
                 import getpass
@@ -4658,8 +5003,187 @@ def _update_node_dependencies() -> None:
             print(f"    {stderr.splitlines()[-1]}")
 
 
+class _UpdateOutputStream:
+    """Stream wrapper used during ``hermes update`` to survive terminal loss.
+
+    Wraps the process's original stdout/stderr so that:
+
+    * Every write is also mirrored to an append-only log file
+      (``~/.hermes/logs/update.log``) that users can inspect after the
+      terminal disconnects.
+    * Writes to the original stream that fail with ``BrokenPipeError`` /
+      ``OSError`` / ``ValueError`` (closed file) no longer cascade into
+      process exit — the update keeps going, only the on-screen output
+      stops.
+
+    Combined with ``SIGHUP -> SIG_IGN`` installed by
+    ``_install_hangup_protection``, this makes ``hermes update`` safe to
+    run in a plain SSH session that might disconnect mid-install.
+    """
+
+    def __init__(self, original, log_file):
+        self._original = original
+        self._log = log_file
+        self._original_broken = False
+
+    def write(self, data):
+        # Mirror to the log file first — it's the most reliable destination.
+        if self._log is not None:
+            try:
+                self._log.write(data)
+            except Exception:
+                # Log errors should never abort the update.
+                pass
+
+        if self._original_broken:
+            return len(data) if isinstance(data, (str, bytes)) else 0
+
+        try:
+            return self._original.write(data)
+        except (BrokenPipeError, OSError, ValueError):
+            # Terminal vanished (SSH disconnect, shell close).  Stop trying
+            # to write to it, but keep the update running.
+            self._original_broken = True
+            return len(data) if isinstance(data, (str, bytes)) else 0
+
+    def flush(self):
+        if self._log is not None:
+            try:
+                self._log.flush()
+            except Exception:
+                pass
+        if self._original_broken:
+            return
+        try:
+            self._original.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            self._original_broken = True
+
+    def isatty(self):
+        if self._original_broken:
+            return False
+        try:
+            return self._original.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        # Some tools probe fileno(); defer to the underlying stream and let
+        # callers handle failures (same behaviour as the unwrapped stream).
+        return self._original.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _install_hangup_protection(gateway_mode: bool = False):
+    """Protect ``cmd_update`` from SIGHUP and broken terminal pipes.
+
+    Users commonly run ``hermes update`` in an SSH session or a terminal
+    that may close mid-install.  Without protection, ``SIGHUP`` from the
+    terminal kills the Python process during ``pip install`` and leaves
+    the venv half-installed; the documented workaround ("use screen /
+    tmux") shouldn't be required for something as routine as an update.
+
+    Protections installed:
+
+    1. ``SIGHUP`` is set to ``SIG_IGN``.  POSIX preserves ``SIG_IGN``
+       across ``exec()``, so pip and git subprocesses also stop dying on
+       hangup.
+    2. ``sys.stdout`` / ``sys.stderr`` are wrapped to mirror output to
+       ``~/.hermes/logs/update.log`` and to silently absorb
+       ``BrokenPipeError`` when the terminal vanishes.
+
+    ``SIGINT`` (Ctrl-C) and ``SIGTERM`` (systemd shutdown) are
+    **intentionally left alone** — those are legitimate cancellation
+    signals the user or OS sent on purpose.
+
+    In gateway mode (``hermes update --gateway``) the update is already
+    spawned detached from a terminal, so this function is a no-op.
+
+    Returns a dict that ``cmd_update`` can pass to
+    ``_finalize_update_output`` on exit.  Returning a dict rather than a
+    tuple keeps the call site forward-compatible with future additions.
+    """
+    state = {
+        "prev_stdout": sys.stdout,
+        "prev_stderr": sys.stderr,
+        "log_file": None,
+        "installed": False,
+    }
+
+    if gateway_mode:
+        return state
+
+    import signal as _signal
+
+    # (1) Ignore SIGHUP for the remainder of this process.
+    if hasattr(_signal, "SIGHUP"):
+        try:
+            _signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
+        except (ValueError, OSError):
+            # Called from a non-main thread — not fatal.  The update still
+            # runs, just without hangup protection.
+            pass
+
+    # (2) Mirror output to update.log and wrap stdio for broken-pipe
+    # tolerance.  Any failure here is non-fatal; we just skip the wrap.
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        logs_dir = get_hermes_home() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = logs_dir / "update.log"
+        log_file = open(log_path, "a", buffering=1, encoding="utf-8")
+
+        import datetime as _dt
+
+        log_file.write(
+            f"\n=== hermes update started "
+            f"{_dt.datetime.now().isoformat(timespec='seconds')} ===\n"
+        )
+
+        state["log_file"] = log_file
+        sys.stdout = _UpdateOutputStream(state["prev_stdout"], log_file)
+        sys.stderr = _UpdateOutputStream(state["prev_stderr"], log_file)
+        state["installed"] = True
+    except Exception:
+        # Leave stdio untouched on any setup failure.  Update continues
+        # without mirroring.
+        state["log_file"] = None
+
+    return state
+
+
+def _finalize_update_output(state):
+    """Restore stdio and close the update.log handle opened by ``_install_hangup_protection``."""
+    if not state:
+        return
+    if state.get("installed"):
+        try:
+            sys.stdout = state.get("prev_stdout", sys.stdout)
+        except Exception:
+            pass
+        try:
+            sys.stderr = state.get("prev_stderr", sys.stderr)
+        except Exception:
+            pass
+    log_file = state.get("log_file")
+    if log_file is not None:
+        try:
+            log_file.flush()
+            log_file.close()
+        except Exception:
+            pass
+
+
 def cmd_update(args):
-    """Update Hermes Agent to the latest version."""
+    """Update Hermes Agent to the latest version.
+
+    Thin wrapper around ``_cmd_update_impl``: installs hangup protection,
+    runs the update, then restores stdio on the way out (even on
+    ``sys.exit`` or unhandled exceptions).
+    """
     from hermes_cli.config import is_managed, managed_error
 
     if is_managed():
@@ -4667,6 +5191,20 @@ def cmd_update(args):
         return
 
     gateway_mode = getattr(args, "gateway", False)
+
+    # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
+    # writes to a closed stdout.  No-op in gateway mode.  See
+    # _install_hangup_protection for rationale.
+    _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    try:
+        _cmd_update_impl(args, gateway_mode=gateway_mode)
+    finally:
+        _finalize_update_output(_update_io_state)
+
+
+def _cmd_update_impl(args, gateway_mode: bool):
+    """Body of ``cmd_update`` — kept separate so the wrapper can always
+    restore stdio even on ``sys.exit``."""
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
@@ -5277,6 +5815,35 @@ def cmd_update(args):
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
 
+        # Warn if legacy Hermes gateway unit files are still installed.
+        # When both hermes.service (from a pre-rename install) and the
+        # current hermes-gateway.service are enabled, they SIGTERM-fight
+        # for the same bot token (see PR #11909). Flagging here means
+        # every `hermes update` surfaces the issue until the user migrates.
+        try:
+            from hermes_cli.gateway import (
+                has_legacy_hermes_units,
+                _find_legacy_hermes_units,
+                supports_systemd_services,
+            )
+
+            if supports_systemd_services() and has_legacy_hermes_units():
+                print()
+                print("⚠ Legacy Hermes gateway unit(s) detected:")
+                for name, path, is_sys in _find_legacy_hermes_units():
+                    scope = "system" if is_sys else "user"
+                    print(f"    {path}  ({scope} scope)")
+                print()
+                print("  These pre-rename units (hermes.service) fight the current")
+                print("  hermes-gateway.service for the bot token and cause SIGTERM")
+                print("  flap loops. Remove them with:")
+                print()
+                print("    hermes gateway migrate-legacy")
+                print()
+                print("  (add `sudo` if any are in system scope)")
+        except Exception as e:
+            logger.debug("Legacy unit check during update failed: %s", e)
+
         print()
         print("Tip: You can now select a provider and model:")
         print("  hermes model              # Select provider and model")
@@ -5673,11 +6240,12 @@ def cmd_dashboard(args):
         import uvicorn  # noqa: F401
     except ImportError:
         print("Web UI dependencies not installed.")
-        print("Install them with:  pip install hermes-agent[web]")
+        print(f"Install them with:  {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'")
         sys.exit(1)
 
-    if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
-        sys.exit(1)
+    if "HERMES_WEB_DIST" not in os.environ:
+        if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
+            sys.exit(1)
 
     from hermes_cli.web_server import start_server
 
@@ -6115,6 +6683,31 @@ For more help on a command:
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
+    # gateway migrate-legacy
+    gateway_migrate_legacy = gateway_subparsers.add_parser(
+        "migrate-legacy",
+        help="Remove legacy hermes.service units from pre-rename installs",
+        description=(
+            "Stop, disable, and remove legacy Hermes gateway unit files "
+            "(e.g. hermes.service) left over from older installs. Profile "
+            "units (hermes-gateway-<profile>.service) and unrelated "
+            "third-party services are never touched."
+        ),
+    )
+    gateway_migrate_legacy.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="List what would be removed without doing it",
+    )
+    gateway_migrate_legacy.add_argument(
+        "-y",
+        "--yes",
+        dest="yes",
+        action="store_true",
+        help="Skip the confirmation prompt",
+    )
+
     gateway_parser.set_defaults(func=cmd_gateway)
 
     # =========================================================================
@@ -6422,6 +7015,13 @@ For more help on a command:
     )
     wh_sub.add_argument(
         "--secret", default="", help="HMAC secret (auto-generated if omitted)"
+    )
+    wh_sub.add_argument(
+        "--deliver-only",
+        action="store_true",
+        help="Skip the agent — deliver the rendered prompt directly as the "
+        "message. Zero LLM cost. Requires --deliver to be a real target "
+        "(not 'log').",
     )
 
     webhook_subparsers.add_parser(
@@ -6849,6 +7449,17 @@ Examples:
         "-f",
         action="store_true",
         help="Remove existing plugin and reinstall",
+    )
+    _install_enable_group = plugins_install.add_mutually_exclusive_group()
+    _install_enable_group.add_argument(
+        "--enable",
+        action="store_true",
+        help="Auto-enable the plugin after install (skip confirmation prompt)",
+    )
+    _install_enable_group.add_argument(
+        "--no-enable",
+        action="store_true",
+        help="Install disabled (skip confirmation prompt); enable later with `hermes plugins enable <name>`",
     )
 
     plugins_update = plugins_subparsers.add_parser(
