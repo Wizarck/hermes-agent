@@ -40,10 +40,7 @@ import hmac
 import json
 import logging
 import os
-import re
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 try:
     from aiohttp import web
@@ -234,34 +231,14 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
         if not content:
             return web.json_response({"ok": True, "skipped": "empty"})
 
-        # ELIGIA HITL pre-check: if this looks like an "aprobar X" / "rechazar X"
-        # reply from a bound identity, write the resolution and ack — skip the
-        # LLM (per .ai-playbook/specs/apply-fix-contract.md §Identity binding).
-        hitl_match = self._try_parse_hitl_intent(phone, content)
-        if hitl_match is not None:
-            written = self._write_hitl_resolution(hitl_match)
-            if written:
-                ack = (
-                    f"✅ Aprobado: {hitl_match['request_id']}"
-                    if hitl_match["approved"]
-                    else f"❌ Rechazado: {hitl_match['request_id']}"
-                )
-                asyncio.create_task(self.send(chat_id=phone, content=ack))
-                logger.info(
-                    "WhatsApp HITL resolved request_id=%s approved=%s phone=%s",
-                    hitl_match["request_id"],
-                    hitl_match["approved"],
-                    _redact_phone(phone),
-                )
-                return web.json_response({"ok": True, "hitl": True})
-            # Write failed — fall through to normal LLM handling so the user
-            # sees Hermes' generic response rather than a silent drop.
-            logger.error(
-                "WhatsApp HITL resolution write failed; falling through to LLM. "
-                "phone=%s request_id=%s",
-                _redact_phone(phone),
-                hitl_match.get("request_id"),
-            )
+        # ELIGIA HITL receive-side moved to waba-mcp `payload_routes` →
+        # aiops `/webhook/hitl` (eligia-core PR-1..3, 2026-05-05). Hermes
+        # no longer sees HITL clicks because button payloads with
+        # `interactive.button_reply.id` starting with `hitl:` are short-
+        # circuited at waba-mcp before reaching the personal_hermes tag
+        # forward. Free-form text replies are no longer interpreted as
+        # approvals (the implicit regex was a security smell — any "aprobar"
+        # in casual chat could resolve).
 
         source = self.build_source(
             chat_id=phone,
@@ -397,209 +374,3 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
             mid = ""
         return SendResult(success=True, message_id=mid)
 
-    # ------------------------------------------------------------------ ELIGIA HITL
-
-    # Approval verbs (case-insensitive). Includes Spanish stems and a couple of
-    # common English fallbacks. The captured group is the request_id.
-    _HITL_APPROVE_RE = re.compile(
-        r"^\s*(?:aprob\w*|aprueb\w*|✅|ok\b|si\b|sí\b|dale\b|yes\b|y\b)\s+(?:el\s+)?(\S+?)\s*$",
-        re.IGNORECASE,
-    )
-    _HITL_REJECT_RE = re.compile(
-        r"^\s*(?:rechaz\w*|recha\w*|❌|no\b|nope\b|n\b)\s+(?:el\s+)?(\S+?)\s*$",
-        re.IGNORECASE,
-    )
-
-    # Bare-token shortcuts (no request_id). When matched, the handler resolves
-    # against the MOST RECENT OPEN envelope from approvals-pending.jsonl
-    # (within the 24 h staleness cutoff). No-match-on-bare implies no open
-    # request → fall through to the LLM so plain "1"/"no" stay conversational.
-    _HITL_BARE_APPROVE_RE = re.compile(
-        r"^\s*(?:aprob\w*|aprueb\w*|✅|ok|si|sí|dale|yes|y|1|👍)\s*$",
-        re.IGNORECASE,
-    )
-    # Reject side uses "2" (not "0") to match human IVR-list convention:
-    # "1) approve / 2) reject" is the cognitive default. The envelope body
-    # in channels/whatsapp.py renders the numbered list explicitly.
-    _HITL_BARE_REJECT_RE = re.compile(
-        r"^\s*(?:rechaz\w*|recha\w*|❌|no|nope|n|2|👎)\s*$",
-        re.IGNORECASE,
-    )
-
-    # Pending entries older than this are skipped when resolving bare tokens
-    # (matches the global 24 h timeout in apply-fix-contract.md §Envelope).
-    _HITL_PENDING_STALENESS_HOURS = 24
-
-    def _try_parse_hitl_intent(self, phone: str, content: str) -> Optional[Dict[str, Any]]:
-        """Detect HITL approve/reject intent in a WhatsApp message.
-
-        Returns ``None`` if the message is not an HITL response (so the
-        caller falls through to the LLM). Otherwise returns a dict with
-        ``request_id``, ``approved``, ``signer``.
-
-        Identity binding: only senders whose phone is in
-        ``WA_HITL_ARTURO_E164`` (env, comma-separated for future
-        multi-signer; v1 is single-signer) get their replies recognised
-        as HITL. Other senders are ignored — Hermes' regular LLM picks
-        them up. The audit-log of identity rejections is intentionally
-        skipped here because non-bound senders are not "trying" to
-        approve; they're just chatting normally.
-        """
-        # Identity binding (HITL-specific list, distinct from
-        # WHATSAPP_VIA_MCP_META_BUSINESS_API_ALLOWED_USERS which gates
-        # conversational access).
-        bound_raw = os.environ.get("WA_HITL_ARTURO_E164", "")
-        bound = {p.strip() for p in bound_raw.split(",") if p.strip()}
-        if not bound or phone not in bound:
-            return None
-
-        approved: Optional[bool] = None
-        request_id: Optional[str] = None
-
-        # 1. Try explicit "verb + id" patterns first.
-        m = self._HITL_APPROVE_RE.match(content)
-        if m:
-            approved = True
-            request_id = m.group(1)
-        else:
-            m = self._HITL_REJECT_RE.match(content)
-            if m:
-                approved = False
-                request_id = m.group(1)
-
-        # 2. Bare-token shortcut (no id). Look up the most recent open request.
-        #    Only applies when the explicit form did NOT match — guards against
-        #    false positives like "ok abc-123" matching both forms.
-        if approved is None:
-            if self._HITL_BARE_APPROVE_RE.match(content):
-                request_id = self._find_most_recent_open_request_id()
-                if request_id:
-                    approved = True
-            elif self._HITL_BARE_REJECT_RE.match(content):
-                request_id = self._find_most_recent_open_request_id()
-                if request_id:
-                    approved = False
-
-        if approved is None or not request_id:
-            return None
-
-        return {
-            "request_id": request_id,
-            "approved": approved,
-            "signer": f"whatsapp:{phone}",
-        }
-
-    def _find_most_recent_open_request_id(self) -> Optional[str]:
-        """Return the latest unresolved request_id within the staleness window.
-
-        Reads ``$ELIGIA_HITL_DIR/approvals-pending.jsonl`` and skips any entry
-        whose ``request_id`` already appears in ``approvals-resolved.jsonl``.
-        Returns None when:
-          - the pending file does not exist,
-          - it is empty,
-          - all entries are resolved already, or
-          - all entries are older than _HITL_PENDING_STALENESS_HOURS.
-
-        Used by ``_try_parse_hitl_intent`` to handle bare-token shortcuts
-        like "1", "ok", "no".
-        """
-        hitl_dir = Path(os.environ.get("ELIGIA_HITL_DIR", "/opt/eligia/data/hitl"))
-        pending = hitl_dir / "approvals-pending.jsonl"
-        resolved = hitl_dir / "approvals-resolved.jsonl"
-
-        if not pending.is_file():
-            return None
-
-        # Build the set of already-resolved ids.
-        resolved_ids: set[str] = set()
-        if resolved.is_file():
-            try:
-                with resolved.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        rid = entry.get("request_id")
-                        if rid:
-                            resolved_ids.add(rid)
-            except OSError:
-                # If resolved is unreadable, treat as no-resolutions; we may
-                # double-resolve a request, but the workflow polling layer
-                # already deduplicates by request_id.
-                resolved_ids = set()
-
-        cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=self._HITL_PENDING_STALENESS_HOURS)
-        )
-
-        try:
-            with pending.open("r", encoding="utf-8") as f:
-                lines = f.readlines()
-        except OSError:
-            return None
-
-        # Walk the pending file in reverse to find the most recent open
-        # (non-resolved, non-stale) entry.
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            rid = entry.get("request_id")
-            if not rid or rid in resolved_ids:
-                continue
-            ts_str = entry.get("ts", "")
-            try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                # Missing/malformed ts → treat as stale (skip).
-                continue
-            if ts < cutoff:
-                continue
-            return rid
-
-        return None
-
-    def _write_hitl_resolution(self, match: Dict[str, Any]) -> bool:
-        """Append a resolution line to ``$ELIGIA_HITL_DIR/approvals-resolved.jsonl``.
-
-        Returns True on success, False on filesystem error. Called by
-        ``_handle_webhook`` after a successful HITL intent parse + identity
-        bind.
-        """
-        hitl_dir = Path(os.environ.get("ELIGIA_HITL_DIR", "/opt/eligia/data/hitl"))
-        try:
-            hitl_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            logger.error(
-                "WhatsApp HITL: mkdir failed at %s: %s", hitl_dir, exc
-            )
-            return False
-
-        resolution = {
-            "request_id": match["request_id"],
-            "approved": bool(match["approved"]),
-            "signer": match["signer"],
-            "channel": "whatsapp",
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        resolved_path = hitl_dir / "approvals-resolved.jsonl"
-        try:
-            with resolved_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(resolution, ensure_ascii=False) + "\n")
-            return True
-        except OSError as exc:
-            logger.error(
-                "WhatsApp HITL: resolution write failed at %s: %s",
-                resolved_path,
-                exc,
-            )
-            return False
