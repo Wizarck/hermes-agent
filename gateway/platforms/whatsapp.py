@@ -66,6 +66,37 @@ def _kill_port_process(port: int) -> None:
     except Exception:
         pass
 
+
+def _terminate_bridge_process(proc, *, force: bool = False) -> None:
+    """Terminate the bridge process using process-tree semantics where possible."""
+    if _IS_WINDOWS:
+        cmd = ["taskkill", "/PID", str(proc.pid), "/T"]
+        if force:
+            cmd.append("/F")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except FileNotFoundError:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+            return
+
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "").strip()
+            raise OSError(details or f"taskkill failed for PID {proc.pid}")
+        return
+
+    import signal
+
+    sig = signal.SIGTERM if not force else signal.SIGKILL
+    os.killpg(os.getpgid(proc.pid), sig)
+
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -154,6 +185,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
+        # Set to True by disconnect() before we SIGTERM our child bridge so
+        # _check_managed_bridge_exit() can distinguish an intentional
+        # shutdown-time exit (returncode -15 / -2 / 0) from a real crash.
+        # Without this, every graceful gateway shutdown/restart would log
+        # "Fatal whatsapp adapter error" plus dispatch a fatal-error
+        # notification before the normal "✓ whatsapp disconnected" fires.
+        self._shutting_down: bool = False
 
     def _whatsapp_require_mention(self) -> bool:
         configured = self.config.extra.get("require_mention")
@@ -368,7 +406,6 @@ class WhatsAppAdapter(BasePlatformAdapter):
             
             # Check if bridge is already running and connected
             import aiohttp
-            import asyncio
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
@@ -525,6 +562,21 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if returncode is None:
             return None
 
+        # Planned shutdown: disconnect() sets _shutting_down before it sends
+        # SIGTERM to the bridge, so a returncode of -15 (SIGTERM), -2 (SIGINT),
+        # or 0 (clean exit) at that point is expected, not a crash. Treat it
+        # as informational and skip the fatal-error path.
+        # getattr-with-default keeps tests that construct the adapter via
+        # ``WhatsAppAdapter.__new__`` (bypassing __init__) working without
+        # every _make_adapter() helper having to seed the attribute.
+        if getattr(self, "_shutting_down", False) and returncode in (0, -2, -15):
+            logger.info(
+                "[%s] Bridge exited during shutdown (code %d).",
+                self.name,
+                returncode,
+            )
+            return None
+
         message = f"WhatsApp bridge process exited unexpectedly (code {returncode})."
         if not self.has_fatal_error:
             logger.error("[%s] %s", self.name, message)
@@ -535,24 +587,20 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
+        # Flip the shutdown flag BEFORE signalling the child so the exit-check
+        # path (which runs from other tasks like send() and the poll loop)
+        # doesn't race us and report the intentional termination as fatal.
+        self._shutting_down = True
         if self._bridge_process:
             try:
-                # Kill the entire process group so child node processes die too
-                import signal
                 try:
-                    if _IS_WINDOWS:
-                        self._bridge_process.terminate()
-                    else:
-                        os.killpg(os.getpgid(self._bridge_process.pid), signal.SIGTERM)
+                    _terminate_bridge_process(self._bridge_process, force=False)
                 except (ProcessLookupError, PermissionError):
                     self._bridge_process.terminate()
                 await asyncio.sleep(1)
                 if self._bridge_process.poll() is None:
                     try:
-                        if _IS_WINDOWS:
-                            self._bridge_process.kill()
-                        else:
-                            os.killpg(os.getpgid(self._bridge_process.pid), signal.SIGKILL)
+                        _terminate_bridge_process(self._bridge_process, force=True)
                     except (ProcessLookupError, PermissionError):
                         self._bridge_process.kill()
             except Exception as e:
@@ -854,11 +902,15 @@ class WhatsAppAdapter(BasePlatformAdapter):
         try:
             import aiohttp
 
-            await self._http_session.post(
+            # Must wrap in `async with` — a bare `await session.post(...)`
+            # leaves the response object alive until GC, holding its TCP
+            # socket in CLOSE_WAIT. See #18451.
+            async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/typing",
                 json={"chatId": chat_id},
                 timeout=aiohttp.ClientTimeout(total=5)
-            )
+            ):
+                pass
         except Exception:
             pass  # Ignore typing indicator failures
     
