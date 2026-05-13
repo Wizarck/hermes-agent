@@ -40,6 +40,149 @@ class TestManifest:
 
 
 # ---------------------------------------------------------------------------
+# Cost-attribution tags (Wizarck/hermes-agent fork extension)
+# ---------------------------------------------------------------------------
+
+class TestCostAttributionTags:
+    """The fork injects `application` + `consumer` into Langfuse metadata so
+    the eligia-core cost-by-tag dashboard can attribute Hermes-driven spend
+    to the `hermes-bot` bucket instead of collapsing into `untagged`."""
+
+    def _fresh_plugin(self):
+        mod_name = "plugins.observability.langfuse"
+        sys.modules.pop(mod_name, None)
+        return importlib.import_module(mod_name)
+
+    def test_application_tag_defaults_to_hermes_bot(self, monkeypatch):
+        for k in ("HERMES_LANGFUSE_APPLICATION", "AIPLAYBOOK_APPLICATION"):
+            monkeypatch.delenv(k, raising=False)
+        mod = self._fresh_plugin()
+        assert mod._application_tag() == "hermes-bot"
+
+    def test_application_tag_reads_hermes_var_first(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_APPLICATION", "hermes-staging")
+        monkeypatch.setenv("AIPLAYBOOK_APPLICATION", "should-lose")
+        mod = self._fresh_plugin()
+        assert mod._application_tag() == "hermes-staging"
+
+    def test_application_tag_falls_back_to_aiplaybook_env(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LANGFUSE_APPLICATION", raising=False)
+        monkeypatch.setenv("AIPLAYBOOK_APPLICATION", "hermes-bot-canary")
+        mod = self._fresh_plugin()
+        assert mod._application_tag() == "hermes-bot-canary"
+
+    def test_consumer_tag_defaults_to_hermes(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LANGFUSE_CONSUMER", raising=False)
+        mod = self._fresh_plugin()
+        assert mod._consumer_tag() == "HERMES"
+
+    def test_consumer_tag_env_override(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_CONSUMER", "HERMES_DEV")
+        mod = self._fresh_plugin()
+        assert mod._consumer_tag() == "HERMES_DEV"
+
+    def test_root_trace_metadata_carries_both_tags(self, monkeypatch):
+        """The trace-level metadata dict built by _start_root_trace MUST
+        include both `application` and `consumer` keys.
+
+        Trace-level tags are the defensive fallback when an observation
+        doesn't carry its own metadata block. The eligia-core aggregator
+        reads `obs.metadata.<dim>` first, `obs.trace.metadata.<dim>` second.
+        """
+        monkeypatch.setenv("HERMES_LANGFUSE_APPLICATION", "hermes-bot")
+        monkeypatch.setenv("HERMES_LANGFUSE_CONSUMER", "HERMES")
+        mod = self._fresh_plugin()
+
+        captured = {}
+
+        class FakeRootSpan:
+            def set_trace_io(self, *_, **__): pass
+
+        class FakeCtx:
+            def __enter__(self_inner):
+                return FakeRootSpan()
+            def __exit__(self_inner, *_a): pass
+
+        class FakeClient:
+            def create_trace_id(self_inner, seed=""):
+                return "fake-trace-id"
+            def start_as_current_observation(self_inner, **kw):
+                captured.update(kw)
+                return FakeCtx()
+
+        # propagate_attributes optional — easier to assert without it.
+        monkeypatch.setattr(mod, "propagate_attributes", None)
+
+        mod._start_root_trace(
+            "task-key",
+            task_id="t",
+            session_id="s",
+            platform="telegram",
+            provider="anthropic",
+            model="claude-haiku-4-5",
+            api_mode="messages",
+            messages=[{"role": "user", "content": "hi"}],
+            client=FakeClient(),
+        )
+        metadata = captured.get("metadata") or {}
+        assert metadata.get("application") == "hermes-bot"
+        assert metadata.get("consumer") == "HERMES"
+        assert metadata.get("source") == "hermes"  # existing tag preserved
+
+    def test_generation_metadata_carries_both_tags(self, monkeypatch):
+        """The PER-OBSERVATION metadata dict built by on_pre_llm_request MUST
+        include both tags. This is the dimension the eligia-core cost-by-tag
+        aggregator groups by; trace-level metadata is just a safety net.
+        """
+        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-test")
+        monkeypatch.setenv("HERMES_LANGFUSE_APPLICATION", "hermes-bot")
+        monkeypatch.setenv("HERMES_LANGFUSE_CONSUMER", "HERMES")
+        mod = self._fresh_plugin()
+
+        observed = {}
+
+        class FakeRootSpan:
+            def start_observation(self_inner, **kw):
+                observed.update(kw)
+                return object()
+
+        class FakeState:
+            root_span = FakeRootSpan()
+            generations = {}
+            tools = {}
+            turn_tool_calls = []
+            last_updated_at = 0.0
+
+        # Pre-populate state so on_pre_llm_request takes the fast path
+        # (no root-trace creation).
+        state = FakeState()
+        mod._TRACE_STATE[mod._trace_key("t", "s")] = state
+
+        # Provide a fake client so _get_langfuse short-circuits to it.
+        monkeypatch.setattr(mod, "_LANGFUSE_CLIENT", object())
+
+        mod.on_pre_llm_request(
+            task_id="t",
+            session_id="s",
+            platform="telegram",
+            model="claude-haiku-4-5",
+            provider="anthropic",
+            api_mode="messages",
+            api_call_count=1,
+            messages=[],
+        )
+        metadata = observed.get("metadata") or {}
+        assert metadata.get("application") == "hermes-bot"
+        assert metadata.get("consumer") == "HERMES"
+        # Existing tags preserved.
+        assert metadata.get("provider") == "anthropic"
+
+        # Cleanup so other tests don't see this state.
+        mod._TRACE_STATE.clear()
+
+
+# ---------------------------------------------------------------------------
 # Plugin discovery: langfuse is opt-in (not loaded unless explicitly enabled).
 # This guards against someone accidentally re-introducing a per-hook
 # load_config() gate or making the plugin auto-load.

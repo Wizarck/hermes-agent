@@ -1,6 +1,6 @@
 name: langfuse
-version: "1.0.0"
-description: "Optional Langfuse observability for Hermes — traces conversations, LLM calls, and tool usage. Opt-in via `hermes plugins enable observability/langfuse` or `hermes tools → Langfuse Observability`."
+version: "1.1.0"
+description: "Optional Langfuse observability for Hermes — traces conversations, LLM calls, and tool usage. Opt-in via `hermes plugins enable observability/langfuse` or `hermes tools → Langfuse Observability`. Wizarck fork: adds cost-attribution metadata (application=hermes-bot, consumer=HERMES) for the eligia-core cost-by-tag dashboard."
 author: NousResearch
 requires_env:
   - HERMES_LANGFUSE_PUBLIC_KEY

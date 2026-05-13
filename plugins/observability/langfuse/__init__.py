@@ -19,6 +19,21 @@ Optional env vars:
   HERMES_LANGFUSE_SAMPLE_RATE - sampling rate 0.0–1.0 (default: 1.0)
   HERMES_LANGFUSE_MAX_CHARS   - max chars per field (default: 12000)
   HERMES_LANGFUSE_DEBUG       - set to "true" for verbose logging
+  HERMES_LANGFUSE_APPLICATION - cost-attribution tag (default: "hermes-bot"); also
+                                read from AIPLAYBOOK_APPLICATION as a secondary
+                                fallback so the same env naming works whether the
+                                ai-playbook helper layer is present or not.
+  HERMES_LANGFUSE_CONSUMER    - budget-bucket tag (default: "HERMES"); mirrors
+                                ai-playbook's `consumer` convention so downstream
+                                aggregators in eligia-core can group cost by both
+                                dimensions (consumer × application).
+
+Custom-fork note: `HERMES_LANGFUSE_APPLICATION` / `_CONSUMER` are NOT in
+upstream NousResearch/hermes-agent. They live in this Wizarck/hermes-agent
+fork so the eligia-core cost-by-tag dashboard (Phase 1 of OpenSpec change
+`add-litellm-enforcement`) can attribute Hermes-driven cost to the
+`hermes-bot` application bucket. Patch is small and localised so it
+survives upstream merges with minimal conflict.
 """
 from __future__ import annotations
 
@@ -78,6 +93,25 @@ def _debug_enabled() -> bool:
 def _debug(message: str) -> None:
     if _debug_enabled():
         logger.info("Langfuse tracing: %s", message)
+
+
+# Cost-attribution tags — custom Wizarck/hermes-agent fork extension.
+# Defaults match the canonical roster in the ai-playbook's
+# specs/model-routing.md §5 ("hermes-bot") and §4 ("HERMES" consumer).
+_DEFAULT_APPLICATION_TAG = "hermes-bot"
+_DEFAULT_CONSUMER_TAG = "HERMES"
+
+
+def _application_tag() -> str:
+    return (
+        _env("HERMES_LANGFUSE_APPLICATION")
+        or _env("AIPLAYBOOK_APPLICATION")
+        or _DEFAULT_APPLICATION_TAG
+    )
+
+
+def _consumer_tag() -> str:
+    return _env("HERMES_LANGFUSE_CONSUMER") or _DEFAULT_CONSUMER_TAG
 
 
 # Sentinel: "_get_langfuse() has tried and failed". Lets us short-circuit
@@ -453,6 +487,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "provider": provider,
         "model": model,
         "api_mode": api_mode,
+        # Cost-attribution tags (Wizarck/hermes-agent fork extension).
+        # Surfaced by eligia-core's cost-by-tag dashboard so Hermes-driven
+        # spend can be attributed to the canonical `hermes-bot` application
+        # bucket without collapsing into "untagged".
+        "application": _application_tag(),
+        "consumer": _consumer_tag(),
     }
 
     # session_id must be passed in trace_context for Langfuse session grouping.
@@ -682,6 +722,12 @@ def on_pre_llm_request(
                 "platform": platform,
                 "api_mode": api_mode,
                 "base_url": base_url,
+                # Same cost-attribution tags as the root trace. Duplicated at the
+                # observation level because eligia-core's cost-by-tag aggregator
+                # reads `obs.metadata.<dim>` per-observation (trace-level
+                # metadata is only used as a defensive fallback).
+                "application": _application_tag(),
+                "consumer": _consumer_tag(),
             },
             model=model,
             model_parameters={"api_mode": api_mode, "provider": provider},
