@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes Gateway (Docker Compose + SOPS secrets)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/hermes
+Environment=SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt
+# Decrypts secrets.env from the eligia-core repo and injects every variable
+# into the docker-compose process so `${VAR}` placeholders in compose.yaml
+# resolve to real values. Without sops, the compose env block would expand
+# to empty strings and the container would start crippled.
+ExecStart=/usr/local/bin/sops exec-env /opt/eligia/eligia-core/secrets/secrets.env 'docker compose up -d --force-recreate'
+ExecStop=/usr/bin/docker compose -f /opt/hermes/docker-compose.yml down
+
+[Install]
+WantedBy=multi-user.target
