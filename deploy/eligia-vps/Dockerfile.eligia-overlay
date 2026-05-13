@@ -1,0 +1,51 @@
+# Custom overlay over upstream nousresearch/hermes-agent for the ELIGIA stack.
+# Adds: whatsapp_via_mcp_meta_business_api platform, web_via_http_sse platform,
+# and the eligia cost-by-tag observability tags in plugins/observability/langfuse.
+#
+# Build context is the fork repo root (Wizarck/hermes-agent). COPY paths below
+# reference files that exist as the actual fork source — no separate /opt/hermes/
+# wamba_build/ snapshot needed.
+#
+# Build (run from fork root):
+#   docker build -f deploy/eligia-vps/Dockerfile.eligia-overlay \
+#                -t eligia/hermes-agent:wamba .
+#
+# Deploy (on VPS, after rebuild):
+#   systemctl restart hermes
+#
+# Compose file: deploy/eligia-vps/docker-compose.yml (symlinked or copied to
+# /opt/hermes/docker-compose.yml). See deploy/eligia-vps/README.md for the
+# full deploy + recovery runbook.
+
+ARG UPSTREAM=nousresearch/hermes-agent@sha256:c47d282991983778e9490949a3c2b014a2428ce505ea74bf48aa7c0e0d65b03f
+FROM ${UPSTREAM}
+
+# All paths are relative to /opt/hermes inside the upstream image.
+COPY --chown=hermes:hermes gateway/platforms/whatsapp_via_mcp_meta_business_api.py /opt/hermes/gateway/platforms/whatsapp_via_mcp_meta_business_api.py
+COPY --chown=hermes:hermes gateway/platforms/web_via_http_sse.py /opt/hermes/gateway/platforms/web_via_http_sse.py
+COPY --chown=hermes:hermes gateway/platforms/base.py /opt/hermes/gateway/platforms/base.py
+COPY --chown=hermes:hermes gateway/platforms/telegram.py /opt/hermes/gateway/platforms/telegram.py
+COPY --chown=hermes:hermes gateway/config.py /opt/hermes/gateway/config.py
+COPY --chown=hermes:hermes gateway/run.py /opt/hermes/gateway/run.py
+COPY --chown=hermes:hermes agent/prompt_builder.py /opt/hermes/agent/prompt_builder.py
+COPY --chown=hermes:hermes toolsets.py /opt/hermes/toolsets.py
+COPY --chown=hermes:hermes cron/scheduler.py /opt/hermes/cron/scheduler.py
+COPY --chown=hermes:hermes tools/send_message_tool.py /opt/hermes/tools/send_message_tool.py
+COPY --chown=hermes:hermes tools/cronjob_tools.py /opt/hermes/tools/cronjob_tools.py
+COPY --chown=hermes:hermes hermes_cli/status.py /opt/hermes/hermes_cli/status.py
+COPY --chown=hermes:hermes hermes_cli/gateway.py /opt/hermes/hermes_cli/gateway.py
+COPY --chown=hermes:hermes hermes_cli/platforms.py /opt/hermes/hermes_cli/platforms.py
+
+# Wizarck/hermes-agent fork patch: langfuse plugin gains application + consumer
+# tags (eligia-core cost-by-tag dashboard, T6 of add-litellm-enforcement).
+COPY --chown=hermes:hermes plugins/observability/langfuse/__init__.py /opt/hermes/plugins/observability/langfuse/__init__.py
+COPY --chown=hermes:hermes plugins/observability/langfuse/plugin.yaml /opt/hermes/plugins/observability/langfuse/plugin.yaml
+
+# Install langfuse SDK (not bundled in upstream nousresearch image).
+# Required by the patched plugins/observability/langfuse for cost-by-tag traces.
+USER root
+RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache "langfuse>=3.0" && chown -R hermes:hermes /opt/hermes
+USER hermes
+
+# Drop pyc caches from the previous build so Python recompiles the patched files.
+RUN find /opt/hermes -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true

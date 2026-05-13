@@ -1,0 +1,73 @@
+services:
+  hermes:
+    # Custom overlay over upstream nousresearch/hermes-agent that adds:
+    #   - whatsapp_via_mcp_meta_business_api platform
+    #   - web_via_http_sse platform (web/SSE webhook receiver)
+    #   - eligia cost-by-tag observability tags in plugins/observability/langfuse
+    #
+    # Build context is this fork repo (Wizarck/hermes-agent). Build command:
+    #   docker build -f deploy/eligia-vps/Dockerfile.eligia-overlay \
+    #                -t eligia/hermes-agent:wamba .
+    # (run from the fork root). See deploy/eligia-vps/README.md for the full
+    # deploy + recovery runbook.
+    image: eligia/hermes-agent:wamba
+    container_name: hermes
+    network_mode: host
+    environment:
+    - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY_HERMES}
+    - OPENROUTER_API_KEY=${OPENROUTER_API_KEY_HERMES}
+    - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    - TELEGRAM_ALLOWED_USERS=1488690040
+    - TELEGRAM_HOME_CHANNEL=1488690040
+    - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
+    - TELEGRAM_WEBHOOK_URL=https://eligia-hermes.palafitofood.com/telegram
+    - TELEGRAM_WEBHOOK_PORT=8642
+    - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET}
+    # WhatsApp via MCP (Meta Business Cloud API) platform — see eligia ADR-012
+    - WHATSAPP_VIA_MCP_META_BUSINESS_API_TOKEN=${WA_ACCESS_TOKEN}
+    - WHATSAPP_VIA_MCP_META_BUSINESS_API_PHONE_NUMBER_ID=${WA_PHONE_NUMBER_ID}
+    - WHATSAPP_VIA_MCP_META_BUSINESS_API_WEBHOOK_SECRET=${HERMES_ADAPTER_SECRET}
+    - WHATSAPP_VIA_MCP_META_BUSINESS_API_HOST=0.0.0.0
+    - WHATSAPP_VIA_MCP_META_BUSINESS_API_PORT=8643
+    - WHATSAPP_VIA_MCP_META_BUSINESS_API_PATH=/wa
+    - WHATSAPP_VIA_MCP_META_BUSINESS_API_ALLOWED_USERS=${WA_HERMES_ALLOWED_USERS}
+    - WHATSAPP_VIA_MCP_META_BUSINESS_API_HOME_CHANNEL=${WA_HERMES_HOME_CHANNEL}
+    - ELIGIA_HITL_DIR=/opt/eligia/data/hitl
+    - WA_HITL_ARTURO_E164=${WA_HERMES_HOME_CHANNEL}
+    # Langfuse observability + cost-attribution tags (Phase 1 T6 of
+    # add-litellm-enforcement). LANGFUSE_* keys live in SOPS-encrypted
+    # /opt/eligia/eligia-core/secrets/secrets.env (injected by sops exec-env
+    # in the hermes.service systemd unit). AIPLAYBOOK_APPLICATION sets the
+    # cost-by-tag dashboard bucket; HERMES_LANGFUSE_APPLICATION wins over it
+    # if both are set, but here we use the playbook-convention name so the
+    # same value works whether or not the helper layer is present.
+    - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+    - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+    - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
+    - AIPLAYBOOK_APPLICATION=hermes-bot
+    - HERMES_LANGFUSE_CONSUMER=HERMES
+    volumes:
+    - /opt/hermes/data/SOUL.md:/opt/data/SOUL.md
+    - /opt/hermes/data/config.yaml:/opt/data/config.yaml
+    - /opt/hermes/data/memories:/opt/data/memories
+    - /opt/hermes/skills:/opt/data/skills
+    - /opt/hermes/data/agents:/opt/data/agents
+    - /opt/eligia/data/hitl:/opt/eligia/data/hitl
+    - hermes-sessions:/opt/data/sessions
+    restart: unless-stopped
+    command:
+    - gateway
+    - run
+    healthcheck:
+      test:
+      - CMD
+      - python3
+      - -c
+      - import socket,sys; sys.exit(0 if socket.socket().connect_ex(("127.0.0.1",8642))==0
+        else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+volumes:
+  hermes-sessions: null
