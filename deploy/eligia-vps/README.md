@@ -51,6 +51,50 @@ closure record. The patched langfuse plugin lives at
 `plugins/observability/langfuse/__init__.py` at the fork root (NOT under
 `deploy/eligia-vps/`) — the Dockerfile here copies it into the image.
 
+## Upstream sync routine (REMEMBER: bump the image pin)
+
+This fork uses the overlay pattern: `Dockerfile.eligia-overlay` starts
+`FROM nousresearch/hermes-agent@sha256:<digest>` and `COPY`s our custom
+source files onto that pinned base image. **The pinned digest and the
+fork's source tree must advance together** — otherwise the overlay
+copies new source files (that may import new modules) on top of an older
+base image that lacks them, and the container crashes at startup with
+`ModuleNotFoundError: No module named 'agent.<something>'`.
+
+Routine for a fresh upstream sync:
+
+```bash
+# 1. Sync the fork source tree.
+cd Wizarck/hermes-agent
+git fetch upstream
+git checkout main
+git merge upstream/main        # resolve conflicts in our patched files
+                               # (gateway/*, plugins/observability/langfuse/*,
+                               # tools/cronjob_tools.py, scripts/release.py, ...)
+git push origin main           # OR open a chore PR for review
+
+# 2. Find the upstream Docker image digest matching the new HEAD.
+HEAD_SHA=$(git rev-parse --short=40 upstream/main)
+TAG="sha-${HEAD_SHA}"  # NousResearch publishes one image per upstream commit
+DIGEST=$(curl -s "https://hub.docker.com/v2/repositories/nousresearch/hermes-agent/tags/${TAG}" \
+          | jq -r '.digest')
+echo "${TAG} → ${DIGEST}"
+
+# 3. Bump deploy/eligia-vps/Dockerfile.eligia-overlay (ARG UPSTREAM=...)
+#    to that digest. Commit. PR. Merge.
+
+# 4. Pull on VPS, rebuild, restart.
+ssh root@178.104.140.21 \
+  "cd /opt/hermes/source && git pull && \
+   docker build -f deploy/eligia-vps/Dockerfile.eligia-overlay \
+                -t eligia/hermes-agent:wamba . && \
+   systemctl restart hermes"
+```
+
+Lesson learned the hard way on 2026-05-13 (see PR #6 in this fork).
+Captured upstream in `Wizarck/ai-playbook` `specs/upstream-sync.md`
+§"Containerised forks — base-image pin discipline".
+
 ## Build + deploy
 
 From the fork root on any machine that has docker + ssh access to the VPS:
