@@ -12,6 +12,8 @@ disaster recovery. Now they're versioned in this fork.
 | `Dockerfile.eligia-overlay` | `/opt/hermes/wamba_build/Dockerfile.eligia-overlay` (legacy) | Custom overlay on `nousresearch/hermes-agent` upstream image |
 | `docker-compose.yml` | `/opt/hermes/docker-compose.yml` | Compose definition: image + env + volumes + healthcheck |
 | `config.yaml` | `/opt/hermes/data/config.yaml` (mounted into container at `/opt/data/config.yaml`) | Hermes-agent runtime config: model defaults, plugins enabled, agent params, personalities, etc. |
+| `hermes.service` | `/etc/systemd/system/hermes.service` | Systemd unit. Decrypts SOPS env via `sops exec-env` and runs `docker compose up -d --force-recreate`. |
+| `migrate-from-wamba-build.sh` | (run-once on VPS) | One-shot migration script: clone fork → symlink compose/config → install systemd unit → rebuild image → restart. |
 
 ## How prod is wired
 
@@ -73,13 +75,17 @@ ssh root@178.104.140.21 \
 # expected: healthy (within ~45s of restart)
 ```
 
-> **Note**: today (2026-05-13) the prod VPS still has the legacy
-> `/opt/hermes/wamba_build/` snapshot directory and **does not yet clone the
-> fork** at `/opt/hermes/source/`. The migration to a fork checkout is a
-> follow-up; until it happens, edits to this directory must be manually
-> scp'd to `/opt/hermes/wamba_build/` (with a matching update to
-> `Dockerfile.eligia-overlay` since paths are relative to the build context).
-> Plan: drop `wamba_build/` entirely and build from `/opt/hermes/source/`.
+> **Migration script**: [`migrate-from-wamba-build.sh`](migrate-from-wamba-build.sh) automates the one-shot
+> transition from the legacy `/opt/hermes/wamba_build/` snapshot to a git
+> checkout at `/opt/hermes/source/`. After running it, the live deployment
+> is sourced from this repo directly; future updates are just
+> `git pull && docker build && systemctl restart hermes`.
+>
+> ```bash
+> ssh root@178.104.140.21 \
+>   'cd /tmp && curl -sL https://raw.githubusercontent.com/Wizarck/hermes-agent/main/deploy/eligia-vps/migrate-from-wamba-build.sh \
+>     | bash'
+> ```
 
 ## Verify Langfuse tracing is active
 
@@ -145,10 +151,9 @@ directories are intact.
 
 ## Out-of-scope (intentionally not here)
 
-- `/etc/systemd/system/hermes.service` — lives on the VPS, not yet
-  versioned. Follow-up: add as `deploy/eligia-vps/hermes.service`.
 - Tunnel / DNS configuration (Cloudflared `eligia-hermes.palafitofood.com` →
   `127.0.0.1:8642`). Managed via the Cloudflare dashboard (`cloudflared`
   remote-managed tunnel; see eligia-core memory note `cloudflared-remote-managed.md`).
 - The `eligia/hermes-agent:wamba` image itself — not pushed to a registry,
-  rebuilt on the VPS. Acceptable risk for a single-instance deployment.
+  rebuilt on the VPS from this source directory. Acceptable risk for a
+  single-instance deployment.
