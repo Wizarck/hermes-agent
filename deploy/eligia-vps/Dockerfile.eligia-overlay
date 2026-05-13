@@ -17,7 +17,11 @@
 # /opt/hermes/docker-compose.yml). See deploy/eligia-vps/README.md for the
 # full deploy + recovery runbook.
 
-ARG UPSTREAM=nousresearch/hermes-agent@sha256:c47d282991983778e9490949a3c2b014a2428ce505ea74bf48aa7c0e0d65b03f
+# Pin matches upstream commit 1979ef580 (HEAD of nousresearch/hermes-agent main
+# at 2026-05-13, which is what our fork's main was synced to in PR #4).
+# Bump this whenever you do a fresh upstream sync to keep the base image's
+# source tree in step with the file paths the overlay COPYs into it.
+ARG UPSTREAM=nousresearch/hermes-agent@sha256:7df9549f19e847ccb6abc67aeb6ce7c8eb7622bce6e93a488e87c3a65c1c54c1
 FROM ${UPSTREAM}
 
 # All paths are relative to /opt/hermes inside the upstream image.
