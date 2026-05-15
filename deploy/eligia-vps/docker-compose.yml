@@ -35,15 +35,21 @@ services:
     - ELIGIA_HITL_DIR=/opt/eligia/data/hitl
     - WA_HITL_ARTURO_E164=${WA_HERMES_HOME_CHANNEL}
     # Langfuse observability + cost-attribution tags (Phase 1 T6 of
-    # add-litellm-enforcement). LANGFUSE_* keys live in SOPS-encrypted
-    # /opt/eligia/eligia-core/secrets/secrets.env (injected by sops exec-env
-    # in the hermes.service systemd unit). AIPLAYBOOK_APPLICATION sets the
-    # cost-by-tag dashboard bucket; HERMES_LANGFUSE_APPLICATION wins over it
-    # if both are set, but here we use the playbook-convention name so the
-    # same value works whether or not the helper layer is present.
+    # add-litellm-enforcement). HERMES_LANGFUSE_* are dedicated Hermes-only
+    # project keys (revocation-isolated from the shared LANGFUSE_* used by
+    # LiteLLM proxy in eligia-core/helm). The plugin reads
+    # HERMES_LANGFUSE_PUBLIC_KEY first and falls back to LANGFUSE_PUBLIC_KEY
+    # if absent — passing both gives belt-and-suspenders during the rollout.
+    # All values live in SOPS-encrypted /opt/eligia/eligia-core/secrets/
+    # secrets.env, distributed to /opt/hermes/.env by sops-to-env.sh hermes
+    # (injected here via shell interpolation when systemd starts the unit).
+    # AIPLAYBOOK_APPLICATION sets the cost-by-tag dashboard bucket;
+    # HERMES_LANGFUSE_APPLICATION wins over it if both are set.
     - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
     - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
     - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
+    - HERMES_LANGFUSE_PUBLIC_KEY=${HERMES_LANGFUSE_PUBLIC_KEY}
+    - HERMES_LANGFUSE_SECRET_KEY=${HERMES_LANGFUSE_SECRET_KEY}
     - AIPLAYBOOK_APPLICATION=hermes-bot
     - HERMES_LANGFUSE_CONSUMER=HERMES
     volumes:
