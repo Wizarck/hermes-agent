@@ -17,11 +17,16 @@
 # /opt/hermes/docker-compose.yml). See deploy/eligia-vps/README.md for the
 # full deploy + recovery runbook.
 
-# Pin matches upstream commit 1979ef580 (HEAD of nousresearch/hermes-agent main
-# at 2026-05-13, which is what our fork's main was synced to in PR #4).
+# Pin matches upstream commit db84a78e6 (HEAD of nousresearch/hermes-agent main
+# at 2026-05-15, brought in by the upstream sync merge in this branch).
+# Notable upstream delta vs the previous pin: PR #26320 "complete observability
+# fix — trace I/O, tool outputs, placeholder credentials" — directly affects
+# plugins/observability/langfuse/__init__.py (our overlay), and adds a
+# HERMES_LANGFUSE_PUBLIC_KEY/SECRET_KEY placeholder-prefix validator that
+# happens to validate exactly the env vars we wired in PR #8.
 # Bump this whenever you do a fresh upstream sync to keep the base image's
 # source tree in step with the file paths the overlay COPYs into it.
-ARG UPSTREAM=nousresearch/hermes-agent@sha256:7df9549f19e847ccb6abc67aeb6ce7c8eb7622bce6e93a488e87c3a65c1c54c1
+ARG UPSTREAM=nousresearch/hermes-agent@sha256:8cbf4cd279f835e2616e25481fe0b7ee1730224c320879206e1537536f2d6fda
 FROM ${UPSTREAM}
 
 # All paths are relative to /opt/hermes inside the upstream image.
