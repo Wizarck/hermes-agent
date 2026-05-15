@@ -2,7 +2,25 @@ model:
   default: claude-haiku-4-5-20251001
   provider: anthropic
 providers: {}
-fallback_providers: []
+# Native fallback chain — see
+# https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers
+# Triggers: 429, 5xx after retry exhaustion; 401/403/404 immediately; invalid
+# response. Per-turn scope (each new message starts on primary). Switch is
+# transparent — keeps conversation history + tool calls + context.
+#
+# Step 1: same Haiku model via OpenRouter (preserves quality; bills against
+# OPENROUTER_API_KEY which is interpolated from OPENROUTER_API_KEY_HERMES via
+# docker-compose env, so consumer-key isolation stays intact).
+# Step 2: cheap OSS via OpenRouter as last-resort insurance if Anthropic
+# Haiku is unreachable end-to-end (rare; same-provider double outage).
+#
+# Added 2026-05-15 after 7+ days of agent.credits.exhausted events from
+# Anthropic credit running dry — without fallback, every Hermes turn 4xx'd.
+fallback_providers:
+  - provider: openrouter
+    model: anthropic/claude-haiku-4-5
+  - provider: openrouter
+    model: openai/gpt-oss-20b
 credential_pool_strategies: {}
 toolsets:
 - hermes-cli
