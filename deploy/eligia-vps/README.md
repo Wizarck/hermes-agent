@@ -1,9 +1,11 @@
 # `deploy/eligia-vps/` — ELIGIA stack deployment for Hermes
 
 Source-of-truth for the production Hermes deployment on the eligia VPS
-(`178.104.140.21`). Until this directory existed (2026-05-13), all three files
-below lived only on the VPS at `/opt/hermes/*` and would have been lost in a
-disaster recovery. Now they're versioned in this fork.
+(`62.238.3.180` — Hetzner CX43, Helsinki, hostname
+`eligia-stockgrab-cx43-20260516-2116`; the old `178.104.140.21` host was
+retired in May 2026). Until this directory existed (2026-05-13), all three
+files below lived only on the VPS at `/opt/hermes/*` and would have been
+lost in a disaster recovery. Now they're versioned in this fork.
 
 ## Contents
 
