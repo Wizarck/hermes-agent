@@ -168,3 +168,43 @@ class TestHooksInert:
         mod.on_post_llm_call(task_id="t", session_id="s", api_call_count=1)
         mod.on_pre_tool_call(tool_name="read_file", args={}, task_id="t", session_id="s")
         mod.on_post_tool_call(tool_name="read_file", args={}, result="ok", task_id="t", session_id="s")
+
+
+class TestTruncateTextMedia:
+    """_truncate_text must neutralize base64 data URIs.
+
+    Langfuse v2 auto-captures any traced string starting with ``data:`` as
+    multimodal media and base64-decodes the tail. Our truncation corrupts that
+    base64 while keeping the ``data:`` prefix, so the SDK logged "Error parsing
+    base64 data URI" once per inbound WhatsApp image. The serializer must
+    replace data URIs with a compact, non-``data:`` marker before any slicing.
+    """
+
+    @staticmethod
+    def _mod():
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def test_data_uri_replaced_with_marker(self):
+        mod = self._mod()
+        uri = "data:image/jpeg;base64," + ("QUJD" * 5000)  # large, like a real photo
+        out = mod._truncate_text(uri, 12000)
+        assert not out.startswith("data:"), "data: prefix must be gone so langfuse skips it"
+        assert out.startswith("[media "), out
+        assert "image/jpeg" in out
+
+    def test_data_uri_without_mime_falls_back_to_octet_stream(self):
+        mod = self._mod()
+        out = mod._truncate_text("data:;base64,QUJD", 12000)
+        assert out.startswith("[media ")
+        assert "application/octet-stream" in out
+
+    def test_plain_short_text_passes_through(self):
+        mod = self._mod()
+        assert mod._truncate_text("hola", 12000) == "hola"
+
+    def test_plain_long_text_still_truncates(self):
+        mod = self._mod()
+        out = mod._truncate_text("x" * 100, 10)
+        assert out.startswith("x" * 10)
+        assert "truncated" in out
