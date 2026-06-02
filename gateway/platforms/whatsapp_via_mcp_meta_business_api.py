@@ -40,6 +40,7 @@ import hmac
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
@@ -80,6 +81,43 @@ def _redact_phone(phone: str) -> str:
     if not phone or len(phone) < 6:
         return "***"
     return f"{phone[:3]}***{phone[-2:]}"
+
+
+# Meta inbound media → file extension. Falls back to the caller's default when
+# the MIME type is missing or unrecognised.
+_MIME_EXT = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/amr": ".amr",
+    "audio/aac": ".aac",
+    "video/mp4": ".mp4",
+    "video/3gpp": ".3gp",
+    "application/pdf": ".pdf",
+}
+
+
+def _ext_for_mime(mime: str, default: str) -> str:
+    if not mime:
+        return default
+    base = mime.split(";", 1)[0].strip().lower()
+    return _MIME_EXT.get(base, default)
+
+
+def _media_cache_dir() -> Path:
+    """Cache dir for WhatsApp media downloaded from Meta. The agent's vision /
+    transcription tools read media by absolute path, same as the bridge
+    platform's image/audio cache."""
+    from gateway.platforms.base import get_hermes_dir
+
+    d = get_hermes_dir("cache/whatsapp", "whatsapp_media")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
@@ -220,16 +258,6 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
 
         if not phone:
             return web.json_response({"error": "missing phone"}, status=400)
-        if msg_type != "text":
-            logger.info(
-                "WhatsApp via MCP: skipping non-text message type=%s phone=%s msg=%s",
-                msg_type,
-                _redact_phone(phone),
-                message_id,
-            )
-            return web.json_response({"ok": True, "skipped": "non_text"})
-        if not content:
-            return web.json_response({"ok": True, "skipped": "empty"})
 
         # ELIGIA HITL receive-side moved to waba-mcp `payload_routes` →
         # aiops `/webhook/hitl` (eligia-core PR-1..3, 2026-05-05). Hermes
@@ -245,12 +273,33 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
             user_id=phone,
             chat_type="dm",
         )
-        event = MessageEvent(
-            source=source,
-            message_type=MessageType.TEXT,
-            text=content,
-            message_id=message_id,
-        )
+
+        if msg_type == "text":
+            if not content:
+                return web.json_response({"ok": True, "skipped": "empty"})
+            event = MessageEvent(
+                source=source,
+                message_type=MessageType.TEXT,
+                text=content,
+                message_id=message_id,
+            )
+        else:
+            # Media message (image/voice/audio/video/document/sticker). The
+            # router forwards the full Meta message as `raw`, which carries the
+            # media id; download it via the Graph API (we already hold the
+            # token) and build a typed event so the agent can see/transcribe it.
+            event = await self._build_media_event(
+                msg_type, phone, message_id, source, payload.get("raw")
+            )
+            if event is None:
+                logger.info(
+                    "WhatsApp via MCP: skipping unhandled/undownloadable "
+                    "type=%s phone=%s msg=%s",
+                    msg_type,
+                    _redact_phone(phone),
+                    message_id,
+                )
+                return web.json_response({"ok": True, "skipped": msg_type})
         # Process asynchronously: the WA-MCP applies a short timeout to the
         # forward POST (Meta requires the original webhook handler to reply
         # in <5 s, and the MCP cascades that constraint). We acknowledge
@@ -373,4 +422,105 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
         except Exception:
             mid = ""
         return SendResult(success=True, message_id=mid)
+
+    # ------------------------------------------------------------------ inbound media
+
+    async def _build_media_event(
+        self,
+        msg_type: str,
+        phone: str,
+        message_id: str,
+        source: Any,
+        raw: Any,
+    ) -> Optional[MessageEvent]:
+        """Download a Meta media message and build a typed MessageEvent.
+
+        ``raw`` is the original Meta message dict (the router forwards it as
+        ``json.loads(raw_json)``); for a media message it carries the media id
+        under a key equal to ``msg_type`` — e.g. ``raw["image"]["id"]`` or
+        ``raw["audio"]["id"]``. Returns ``None`` for unsupported types or on
+        download failure so the caller can ACK-and-skip without 500-ing the
+        webhook (Meta retries 5xx, which would loop).
+        """
+        meta_msg = raw if isinstance(raw, dict) else {}
+        if not meta_msg and isinstance(raw, str) and raw:
+            try:
+                meta_msg = json.loads(raw)
+            except (ValueError, TypeError):
+                meta_msg = {}
+
+        media_obj = meta_msg.get(msg_type) or {}
+        media_id = media_obj.get("id")
+        if not media_id:
+            return None
+
+        mime = (media_obj.get("mime_type") or "").split(";", 1)[0].strip()
+        caption = (media_obj.get("caption") or "").strip()
+
+        if msg_type in ("image", "sticker"):
+            mtype, ext = MessageType.PHOTO, _ext_for_mime(mime, ".jpg")
+        elif msg_type in ("audio", "voice"):
+            mtype, ext = MessageType.VOICE, _ext_for_mime(mime, ".ogg")
+        elif msg_type == "video":
+            mtype, ext = MessageType.VIDEO, _ext_for_mime(mime, ".mp4")
+        elif msg_type == "document":
+            ext = Path(media_obj.get("filename") or "").suffix or _ext_for_mime(mime, ".bin")
+            mtype = MessageType.DOCUMENT
+        else:
+            return None
+
+        try:
+            local_path = await self._download_meta_media(media_id, ext)
+        except Exception as e:  # noqa: BLE001 — a download error must not 500 the webhook
+            logger.warning(
+                "WhatsApp via MCP: media download failed type=%s id=%s: %s",
+                msg_type,
+                media_id,
+                e,
+            )
+            return None
+
+        logger.info(
+            "WhatsApp via MCP: cached %s media id=%s mime=%s -> %s",
+            msg_type,
+            media_id,
+            mime or "?",
+            local_path,
+        )
+        return MessageEvent(
+            source=source,
+            message_type=mtype,
+            text=caption,
+            message_id=message_id,
+            media_urls=[local_path],
+            media_types=[mime or "application/octet-stream"],
+        )
+
+    async def _download_meta_media(self, media_id: str, ext: str) -> str:
+        """Resolve a Meta media id to bytes and cache it; return the file path.
+
+        Two-step Graph flow: ``GET /{media-id}`` returns a short-lived URL on
+        ``lookaside.fbsbx.com`` that itself requires the bearer token to fetch.
+        """
+        if self._http_client is None:
+            raise RuntimeError("adapter not connected")
+        headers = {"Authorization": f"Bearer {self._token}"}
+
+        meta = await self._http_client.get(
+            f"{self._meta_base_url}/{media_id}", headers=headers
+        )
+        meta.raise_for_status()
+        url = (meta.json() or {}).get("url")
+        if not url:
+            raise ValueError("Meta returned no media url")
+
+        resp = await self._http_client.get(url, headers=headers, follow_redirects=True)
+        resp.raise_for_status()
+        data = resp.content
+        if not data:
+            raise ValueError("empty media body")
+
+        path = _media_cache_dir() / f"wa_{media_id}{ext}"
+        path.write_bytes(data)
+        return str(path)
 

@@ -149,7 +149,21 @@ def _trace_key(task_id: str, session_id: str) -> str:
     return f"thread:{threading.get_ident()}"
 
 
+_DATA_URI_PREFIX = "data:"
+
+
 def _truncate_text(value: str, max_chars: int) -> str:
+    # Langfuse v2 auto-captures any traced string starting with "data:" as
+    # multimodal media (media_manager._find_and_process_media), then runs
+    # base64.b64decode on the tail. Our own truncation corrupts that base64
+    # while leaving the "data:" prefix intact, so the SDK logs "Error parsing
+    # base64 data URI" once per inbound image. Replace data URIs with a
+    # compact, non-"data:" marker BEFORE slicing so the SDK skips them
+    # entirely. This only mutates the trace copy, never the real LLM request.
+    if value.startswith(_DATA_URI_PREFIX):
+        header, _, rest = value[len(_DATA_URI_PREFIX):].partition(",")
+        mime = header.split(";", 1)[0] or "application/octet-stream"
+        return f"[media {mime} {len(rest)} b64 chars omitted]"
     if len(value) <= max_chars:
         return value
     return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
