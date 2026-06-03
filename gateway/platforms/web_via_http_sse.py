@@ -96,6 +96,26 @@ def _redact_session(session_id: str) -> str:
     return f"{session_id[:4]}***{session_id[-2:]}"
 
 
+# A reply asks the web widget to surface its lead-capture form by embedding
+# this sentinel. send() strips it from the visible text and emits a
+# `capture-prompt` SSE event. This keeps lead capture model-driven - the agent
+# decides, via the bank/SOUL prompt, when it has qualified the visitor - without
+# wiring a bespoke agent tool into the runner.
+_CAPTURE_SENTINEL = "[[CAPTURE_LEAD]]"
+
+
+def _extract_capture(content):
+    """Split a reply into ``(visible_text, capture_requested)``.
+
+    Strips every occurrence of the CAPTURE_LEAD sentinel from *content* so the
+    marker never reaches the user, and reports whether it was present.
+    """
+    text = content or ""
+    if _CAPTURE_SENTINEL in text:
+        return text.replace(_CAPTURE_SENTINEL, "").strip(), True
+    return text, False
+
+
 class _ActiveStream:
     """Per-session state for an open SSE response.
 
@@ -425,7 +445,10 @@ class WebViaHttpSsePlatformAdapter(BasePlatformAdapter):
         if stream.cancelled:
             return SendResult(success=False, error="stream_cancelled")
         try:
-            await self._write_event(stream, "token", {"chunk": content or ""})
+            text, capture_requested = _extract_capture(content)
+            await self._write_event(stream, "token", {"chunk": text})
+            if capture_requested:
+                await self._write_event(stream, "capture-prompt", {})
             await self._write_event(stream, "done", {"finishReason": "stop"})
         except (ConnectionError, asyncio.CancelledError) as e:
             stream.cancelled = True
