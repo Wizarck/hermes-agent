@@ -126,6 +126,18 @@ def _consumer_tag() -> str:
     return _env("HERMES_LANGFUSE_CONSUMER") or _DEFAULT_CONSUMER_TAG
 
 
+def _profile_tag() -> str:
+    # Per-profile/agent cost attribution (Wizarck fork). Explicit
+    # HERMES_LANGFUSE_PROFILE wins; else HERMES_HOME basename (the active
+    # profile dir under Arch B); else "default".
+    import os as _os
+    return (
+        _env("HERMES_LANGFUSE_PROFILE")
+        or _os.path.basename((_env("HERMES_HOME") or "").rstrip("/"))
+        or "default"
+    )
+
+
 # Sentinel: "_get_langfuse() has tried and failed". Lets us short-circuit
 # every subsequent hook call without re-checking env vars or re-attempting
 # SDK init. Tests clear this by reloading the module via
@@ -613,6 +625,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         # bucket without collapsing into "untagged".
         "application": _application_tag(),
         "consumer": _consumer_tag(),
+        "profile": _profile_tag(),
     }
 
     # session_id must be passed in trace_context for Langfuse session grouping.
@@ -861,6 +874,7 @@ def on_pre_llm_request(
                 # metadata is only used as a defensive fallback).
                 "application": _application_tag(),
                 "consumer": _consumer_tag(),
+                "profile": _profile_tag(),
             },
             model=model,
             model_parameters={"api_mode": api_mode, "provider": provider},
