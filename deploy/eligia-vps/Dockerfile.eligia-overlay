@@ -26,7 +26,7 @@
 # happens to validate exactly the env vars we wired in PR #8.
 # Bump this whenever you do a fresh upstream sync to keep the base image's
 # source tree in step with the file paths the overlay COPYs into it.
-ARG UPSTREAM=nousresearch/hermes-agent@sha256:8cbf4cd279f835e2616e25481fe0b7ee1730224c320879206e1537536f2d6fda
+ARG UPSTREAM=nousresearch/hermes-agent@sha256:2a415474440bdf4e770d41471f6bfd6cc8445db9be9e98169d92e537a450ff82
 FROM ${UPSTREAM}
 
 # All paths are relative to /opt/hermes inside the upstream image.
