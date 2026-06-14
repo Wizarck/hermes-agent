@@ -27,6 +27,7 @@ PLATFORMS: OrderedDict[str, PlatformInfo] = OrderedDict([
     ("whatsapp_via_mcp_meta_business_api",
                        PlatformInfo(label="💬 WhatsApp (Meta Cloud via MCP)",
                                     default_toolset="hermes-whatsapp-via-mcp-meta-business-api")),
+    ("whatsapp_cloud", PlatformInfo(label="📱 WhatsApp Business (Cloud)", default_toolset="hermes-whatsapp")),
     ("signal",         PlatformInfo(label="📡 Signal",          default_toolset="hermes-signal")),
     ("bluebubbles",    PlatformInfo(label="💙 BlueBubbles",     default_toolset="hermes-bluebubbles")),
     ("email",          PlatformInfo(label="📧 Email",           default_toolset="hermes-email")),
