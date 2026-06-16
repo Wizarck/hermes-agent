@@ -63,7 +63,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    resolve_channel_prompt,
+    resolve_channel_skills,
 )
+from gateway.platforms.helpers import MessageDeduplicator
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +151,10 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP_VIA_MCP_META_BUSINESS_API)
         self._token: str = config.token or ""
+        # Defense-in-depth idempotency: waba-mcp already dedups per wamid, but a
+        # retried forward / second producer must not spawn a duplicate agent
+        # run. Same helper Slack/Feishu use at this consumer layer.
+        self._dedup = MessageDeduplicator()
         extra = config.extra or {}
         self._phone_number_id: str = extra.get("phone_number_id") or os.getenv(
             "WHATSAPP_VIA_MCP_META_BUSINESS_API_PHONE_NUMBER_ID", ""
@@ -235,6 +242,83 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
             }
         )
 
+    # ------------------------------------------------------------------ role routing
+
+    def _allowed_roles(self) -> set:
+        """Roles WS2 will honour.
+
+        Either an explicit ``roles`` list in ``config.extra``, or implicitly the
+        union of the keys configured under ``channel_prompts`` and the ids under
+        ``channel_skill_bindings``. An empty set means role routing is off and
+        the platform behaves exactly as before WS2 (single persona).
+        """
+        extra = self.config.extra or {}
+        explicit = extra.get("roles")
+        if isinstance(explicit, list) and explicit:
+            return {str(r).strip() for r in explicit if str(r).strip()}
+        allowed: set = set()
+        prompts = extra.get("channel_prompts")
+        if isinstance(prompts, dict):
+            allowed.update(str(k) for k in prompts)
+        bindings = extra.get("channel_skill_bindings")
+        if isinstance(bindings, list):
+            for entry in bindings:
+                if isinstance(entry, dict) and entry.get("id"):
+                    allowed.add(str(entry["id"]))
+        return allowed
+
+    def _resolve_role(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Resolve the persona/role for an inbound message.
+
+        The upstream waba-mcp gate (WS1) decides the role and forwards it; this
+        platform only *reads* it — it does NOT re-parse text prefixes (that
+        lives at the gate). Precedence:
+          1. an explicit ``role`` field on the forward payload,
+          2. a ``role:<name>`` entry (or a bare known-role) in ``tags``,
+          3. the configured ``default_role``.
+        A candidate is honoured only if it is an allowed role; otherwise None
+        (single-persona behaviour, identical to pre-WS2).
+        """
+        allowed = self._allowed_roles()
+        if not allowed:
+            return None
+
+        candidate = ""
+        raw_role = payload.get("role")
+        if isinstance(raw_role, str):
+            candidate = raw_role.strip()
+
+        if not candidate:
+            tags = payload.get("tags")
+            if isinstance(tags, list):
+                for tag in tags:
+                    if not isinstance(tag, str):
+                        continue
+                    t = tag.strip()
+                    if t.startswith("role:"):
+                        candidate = t.split(":", 1)[1].strip()
+                        break
+                    if t in allowed:
+                        candidate = t
+                        break
+
+        if not candidate:
+            default_role = (self.config.extra or {}).get("default_role")
+            candidate = str(default_role).strip() if default_role else ""
+
+        return candidate if candidate in allowed else None
+
+    def _resolve_tier(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Read the forwarded ``tier`` (criticality), if any.
+
+        Carried through for logging / future model-class selection; the routing
+        axis is the role, not the tier.
+        """
+        raw = payload.get("tier")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        return None
+
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         body = await request.read()
         if self._secret:
@@ -259,6 +343,15 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
         if not phone:
             return web.json_response({"error": "missing phone"}, status=400)
 
+        # Drop a redelivered/duplicate message (by wamid) before any work, so a
+        # retried forward never spawns a second agent run. Empty ids skip dedup.
+        if message_id and self._dedup.is_duplicate(message_id):
+            logger.info(
+                "WhatsApp via MCP: duplicate msg=%s phone=%s — skipping",
+                message_id, _redact_phone(phone),
+            )
+            return web.json_response({"ok": True, "duplicate": True})
+
         # ELIGIA HITL receive-side moved to waba-mcp `payload_routes` →
         # aiops `/webhook/hitl` (eligia-core PR-1..3, 2026-05-05). Hermes
         # no longer sees HITL clicks because button payloads with
@@ -268,10 +361,27 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
         # approvals (the implicit regex was a security smell — any "aprobar"
         # in casual chat could resolve).
 
+        # WS2 role router: the upstream waba-mcp gate resolves which persona
+        # (role) this message belongs to and forwards it; we only *read* it and
+        # feed it into the existing per-channel machinery — thread_id → a
+        # per-role session/transcript, channel_prompts → a per-role SOUL
+        # overlay, channel_skill_bindings → per-role skills. When no role is
+        # configured/resolved this is a no-op (single persona, as before).
+        role = self._resolve_role(payload)
+        tier = self._resolve_tier(payload)
+        channel_prompt = (
+            resolve_channel_prompt(self.config.extra, role) if role else None
+        )
+        auto_skill = (
+            resolve_channel_skills(self.config.extra, role) if role else None
+        )
+
         source = self.build_source(
             chat_id=phone,
             user_id=phone,
             chat_type="dm",
+            thread_id=role or None,
+            role=role or None,
         )
 
         if msg_type == "text":
@@ -282,6 +392,8 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
                 message_type=MessageType.TEXT,
                 text=content,
                 message_id=message_id,
+                channel_prompt=channel_prompt,
+                auto_skill=auto_skill,
             )
         else:
             # Media message (image/voice/audio/video/document/sticker). The
@@ -300,15 +412,19 @@ class WhatsAppViaMcpMetaBusinessApiAdapter(BasePlatformAdapter):
                     message_id,
                 )
                 return web.json_response({"ok": True, "skipped": msg_type})
+            event.channel_prompt = channel_prompt
+            event.auto_skill = auto_skill
         # Process asynchronously: the WA-MCP applies a short timeout to the
         # forward POST (Meta requires the original webhook handler to reply
         # in <5 s, and the MCP cascades that constraint). We acknowledge
         # immediately and let send() deliver the reply when Hermes finishes.
         asyncio.create_task(self.handle_message(event))
         logger.info(
-            "WhatsApp via MCP queued msg=%s phone=%s len=%d",
+            "WhatsApp via MCP queued msg=%s phone=%s role=%s tier=%s len=%d",
             message_id,
             _redact_phone(phone),
+            role or "-",
+            tier or "-",
             len(content),
         )
         return web.json_response({"ok": True, "queued": True})

@@ -55,6 +55,9 @@ _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
+# WS3: persona/role multiplexed within a single channel (e.g. the WhatsApp role
+# router). Read per-operation by the memory provider to resolve a per-role bank.
+_SESSION_ROLE: ContextVar = ContextVar("HERMES_SESSION_ROLE", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -70,6 +73,7 @@ _VAR_MAP = {
     "HERMES_SESSION_USER_ID": _SESSION_USER_ID,
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
     "HERMES_SESSION_KEY": _SESSION_KEY,
+    "HERMES_SESSION_ROLE": _SESSION_ROLE,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -84,6 +88,7 @@ def set_session_vars(
     user_id: str = "",
     user_name: str = "",
     session_key: str = "",
+    role: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -101,6 +106,7 @@ def set_session_vars(
         _SESSION_USER_ID.set(user_id),
         _SESSION_USER_NAME.set(user_name),
         _SESSION_KEY.set(session_key),
+        _SESSION_ROLE.set(role),
     ]
     return tokens
 
@@ -124,6 +130,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_USER_ID,
         _SESSION_USER_NAME,
         _SESSION_KEY,
+        _SESSION_ROLE,
     ):
         var.set("")
 

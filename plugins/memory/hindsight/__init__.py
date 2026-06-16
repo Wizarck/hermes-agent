@@ -484,6 +484,9 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
       {platform}  — "cli", "telegram", "discord", etc.
       {user}      — platform user id (gateway sessions)
       {session}   — current session id
+      {role}      — WS2/WS3 persona/role multiplexed within one channel
+                    (from the HERMES_SESSION_ROLE contextvar; re-resolved
+                    per-operation by _effective_bank_id)
 
     Missing/empty placeholders are rendered as the empty string and then
     collapsed — e.g. ``hermes-{user}`` with no user becomes ``hermes``.
@@ -1137,6 +1140,7 @@ class HindsightMemoryProvider(MemoryProvider):
             platform=self._platform,
             user=self._user_id,
             session=self._session_id,
+            role="",  # no role at init → the no-role fallback bank (WS3)
         )
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
@@ -1250,19 +1254,19 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._memory_mode == "context":
             return (
                 f"# Hindsight Memory\n"
-                f"Active (context mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
+                f"Active (context mode). Bank: {self._effective_bank_id()}, budget: {self._budget}.\n"
                 f"Relevant memories are automatically injected into context."
             )
         if self._memory_mode == "tools":
             return (
                 f"# Hindsight Memory\n"
-                f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
+                f"Active (tools mode). Bank: {self._effective_bank_id()}, budget: {self._budget}.\n"
                 f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
                 f"hindsight_retain to store facts."
             )
         return (
             f"# Hindsight Memory\n"
-            f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
+            f"Active. Bank: {self._effective_bank_id()}, budget: {self._budget}.\n"
             f"Relevant memories are automatically injected into context. "
             f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
             f"hindsight_retain to store facts."
@@ -1286,6 +1290,36 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    def _effective_bank_id(self) -> str:
+        """Bank id for the current operation.
+
+        Fast path: when the configured ``bank_id_template`` has no ``{role}``
+        placeholder, the init-resolved ``_bank_id`` is returned unchanged — zero
+        behavioural change for existing single-bank configs. When the template
+        is role-aware, the bank is re-resolved per-call from the task-local
+        ``HERMES_SESSION_ROLE`` contextvar so concurrent messages on different
+        roles never cross banks (WS3). Callers that defer work to a thread or
+        queue MUST capture this value synchronously.
+        """
+        if not self._bank_id_template or "{role}" not in self._bank_id_template:
+            return self._bank_id
+        try:
+            from gateway.session_context import get_session_env
+
+            role = get_session_env("HERMES_SESSION_ROLE", "")
+        except Exception:
+            role = ""
+        return _resolve_bank_id_template(
+            self._bank_id_template,
+            fallback=self._bank_id,
+            profile=self._agent_identity,
+            workspace=self._agent_workspace,
+            platform=self._platform,
+            user=self._user_id,
+            session=self._session_id,
+            role=role,
+        )
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1300,15 +1334,19 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
 
+        # Capture the (possibly role-aware) bank synchronously: _run() executes
+        # on a separate thread that does not inherit this task's contextvars (WS3).
+        bank_id = self._effective_bank_id()
+
         def _run():
             try:
                 if self._prefetch_method == "reflect":
-                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", bank_id, len(query))
+                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=bank_id, query=query, budget=self._budget))
                     text = resp.text or ""
                 else:
                     recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
+                        "bank_id": bank_id, "query": query,
                         "budget": self._budget, "max_tokens": self._recall_max_tokens,
                     }
                     if self._recall_tags:
@@ -1317,7 +1355,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     if self._recall_types:
                         recall_kwargs["types"] = self._recall_types
                     logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                                 self._bank_id, len(query), self._budget)
+                                 bank_id, len(query), self._budget)
                     resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                     num_results = len(resp.results) if resp.results else 0
                     logger.debug("Prefetch: recall returned %d results", num_results)
@@ -1385,7 +1423,7 @@ class HindsightMemoryProvider(MemoryProvider):
         retain_async: bool | None = None,
     ) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {
-            "bank_id": self._bank_id,
+            "bank_id": self._effective_bank_id(),
             "content": content,
             "metadata": metadata or self._build_metadata(message_count=1, turn_index=self._turn_index),
         }
@@ -1449,7 +1487,7 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         num_turns = len(self._session_turns)
         document_id, update_mode = self._resolve_retain_target(self._document_id)
-        bank_id = self._bank_id
+        bank_id = self._effective_bank_id()
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
 
@@ -1498,7 +1536,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     tags=args.get("tags"),
                 )
                 logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
-                             self._bank_id, len(content), context)
+                             self._effective_bank_id(), len(content), context)
                 self._run_hindsight_operation(lambda client: client.aretain(**retain_kwargs))
                 logger.debug("Tool hindsight_retain: success")
                 return json.dumps({"result": "Memory stored successfully."})
@@ -1511,8 +1549,9 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
+                bank_id = self._effective_bank_id()
                 recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
+                    "bank_id": bank_id, "query": query, "budget": self._budget,
                     "max_tokens": self._recall_max_tokens,
                 }
                 if self._recall_tags:
@@ -1521,7 +1560,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
+                             bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                 num_results = len(resp.results) if resp.results else 0
                 logger.debug("Tool hindsight_recall: %d results", num_results)
@@ -1538,11 +1577,12 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
+                bank_id = self._effective_bank_id()
                 logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
+                             bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(
                     lambda client: client.areflect(
-                        bank_id=self._bank_id, query=query, budget=self._budget
+                        bank_id=bank_id, query=query, budget=self._budget
                     )
                 )
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
@@ -1621,6 +1661,12 @@ class HindsightMemoryProvider(MemoryProvider):
             old_document_id, old_update_mode = self._resolve_retain_target(
                 self._document_id
             )
+            # Capture the role-aware bank SYNCHRONOUSLY (like doc_id/metadata
+            # above): _flush runs in the writer thread, which does not inherit
+            # the HERMES_SESSION_ROLE contextvar, so reading the bank inside the
+            # thread would resolve the no-role fallback instead of this
+            # (old) session's per-role bank. WS3 invariant.
+            old_bank_id = self._effective_bank_id()
 
             def _flush():
                 try:
@@ -1636,11 +1682,11 @@ class HindsightMemoryProvider(MemoryProvider):
                         item["update_mode"] = old_update_mode
                     logger.debug(
                         "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
-                        self._bank_id, old_document_id, old_update_mode, len(old_turns),
+                        old_bank_id, old_document_id, old_update_mode, len(old_turns),
                     )
                     self._run_hindsight_operation(
                         lambda client: client.aretain_batch(
-                            bank_id=self._bank_id,
+                            bank_id=old_bank_id,
                             items=[item],
                             document_id=old_document_id,
                             retain_async=self._retain_async,

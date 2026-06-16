@@ -3213,6 +3213,7 @@ class BasePlatformAdapter(ABC):
         guild_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
+        role: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -3233,6 +3234,7 @@ class BasePlatformAdapter(ABC):
             guild_id=str(guild_id) if guild_id else None,
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
+            role=role,
         )
     
     @abstractmethod

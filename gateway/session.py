@@ -91,6 +91,7 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    role: Optional[str] = None  # WS2/WS3 persona/role multiplexed within one channel (WhatsApp role router)
     
     @property
     def description(self) -> str:
