@@ -1,0 +1,13 @@
+{
+  "name": "waba-routing",
+  "label": "Routing",
+  "description": "WhatsApp line & role routing — multi-number registry (lines, sender grants, audit). Backed by the waba-mcp admin API.",
+  "icon": "Globe",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/waba-routing",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
