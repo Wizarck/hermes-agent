@@ -14,7 +14,15 @@ services:
     container_name: hermes
     network_mode: host
     environment:
-    - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY_HERMES}
+    # Auth to native Anthropic via Claude Max OAuth (Bearer token).
+    # The plugin profile (plugins/model-providers/anthropic/__init__.py:47)
+    # resolves env_vars left-to-right and ANTHROPIC_API_KEY wins over the
+    # OAuth token if both are set — keep only the OAuth var here so the
+    # request hits the Max lane instead of the API-key lane. Verified
+    # 2026-05-21: Haiku 4.5 + tools via OAuth Max routes to the Max lane
+    # (anthropic-ratelimit-unified-5h-utilization header present on 200s).
+    # Issue #15080 may still bite Opus/Sonnet; this deploy uses Haiku.
+    - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN_HERMES}
     - OPENROUTER_API_KEY=${OPENROUTER_API_KEY_HERMES}
     - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
     - TELEGRAM_ALLOWED_USERS=1488690040
